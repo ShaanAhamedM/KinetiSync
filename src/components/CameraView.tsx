@@ -6,6 +6,7 @@ import { renderLiveHand, renderGhostHand } from '../utils/renderingEngine';
 import type { DtwWorkerOutput } from '../utils/dtwWorker';
 import { useHandTracking, type BiomechanicalResult } from '../hooks/useHandTracking';
 import { useVoiceControl } from '../hooks/useVoiceControl';
+import { useOpticalFlow, REQUIRED_POINTS } from '../hooks/useOpticalFlow';
 import { useAppStore } from '../store/useAppStore';
 import type { AttemptRecord } from '../store/useAppStore';
 import { use3DStore } from '../store/use3DStore';
@@ -19,10 +20,13 @@ interface CameraViewProps {
 }
 
 const WINDOW_SIZE = 15; // Number of frames to send to DTW worker for analysis
+const POINT_LABELS = ['PALM', 'THUMB', 'INDEX', 'MIDDLE', 'RING', 'PINKY'];
 
 export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
   const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
+  const secVideoRef = useRef<HTMLVideoElement>(null);
+  const [secVideoEl, setSecVideoEl] = useState<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const telemetryCanvasRef = useRef<HTMLCanvasElement>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -90,6 +94,27 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       }
     };
   }, []);
+
+  // Setup Optical Flow for Cardboard Hand Tracking (hardware feedback)
+  const { isCvReady, trackingPoints, addTrackingPoint, resetTracking, setOnFlowResults } = useOpticalFlow(secVideoEl);
+  const physicalFeedback = use3DStore(state => state.physicalFeedback);
+  const lastCommandedAnglesRef = useRef<number[] | null>(null);
+  useEffect(() => {
+    setOnFlowResults((result) => {
+      use3DStore.getState().setPhysicalFeedback(result);
+    });
+  }, [setOnFlowResults]);
+
+  // Hardware sync: how closely the cardboard hand's observed finger angles match
+  // the angles we last commanded it to move to.
+  let hwSyncScore: number | null = null;
+  let hwFingerErrors: number[] | null = null;
+  if (physicalFeedback && lastCommandedAnglesRef.current) {
+    const commanded = lastCommandedAnglesRef.current;
+    hwFingerErrors = physicalFeedback.angles.map((observed, i) => Math.abs(observed - (commanded[i] ?? observed)));
+    const avgErr = hwFingerErrors.reduce((a, b) => a + b, 0) / hwFingerErrors.length;
+    hwSyncScore = Math.max(0, 100 - (avgErr / 180) * 100);
+  }
 
   // Initialize Worker and Load Profile
   useEffect(() => {
@@ -290,6 +315,26 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               videoRef.current?.play().catch(e => console.error("Auto-play prevented", e));
               if (onStreamReady) onStreamReady(stream);
             };
+          }
+
+          // Attempt to grab a secondary camera for hardware tracking
+          try {
+            const devices = await navigator.mediaDevices.enumerateDevices();
+            const videoInputs = devices.filter(d => d.kind === 'videoinput');
+            if (videoInputs.length > 1) {
+              const secStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: videoInputs[1].deviceId } });
+              if (secVideoRef.current) {
+                secVideoRef.current.srcObject = secStream;
+                secVideoRef.current.play().catch(e => console.error("Secondary auto-play prevented", e));
+              }
+            } else {
+              if (secVideoRef.current) {
+                secVideoRef.current.srcObject = stream.clone();
+                secVideoRef.current.play().catch(e => console.error("Secondary auto-play prevented", e));
+              }
+            }
+          } catch (secError) {
+            console.warn("Could not attach secondary camera", secError);
           }
         } catch (err: any) {
           const msg = err.name === 'NotAllowedError' ? "Camera access denied." : "Could not access camera.";
@@ -524,6 +569,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         // Transmit to ESP32 Hardware (throttle to ~30fps)
         if (now - lastWorkerTime > 30) {
            const angles = hardwareBridge.calculateAngles(liveHand);
+           lastCommandedAnglesRef.current = angles;
            hardwareBridge.sendAngles(angles);
         }
       }
@@ -642,8 +688,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       {/* Main Workspace Split */}
       <div className="flex-1 flex flex-row relative">
         
-        {/* Left: Original Video */}
-        <div className="flex-1 relative border-r border-white/10 overflow-hidden bg-black flex items-center justify-center">
+        {/* Left: Video Feeds */}
+        <div className="flex-1 flex flex-col relative border-r border-white/10 overflow-hidden bg-black">
+          
+          {/* Top: Original Video */}
+          <div className="flex-1 relative border-b border-white/10 flex items-center justify-center">
           {errorMsg ? (
             <div className="text-center panel p-8 border-red-500/30">
               <h3 className="text-red-500 mb-4 text-xl">System Error</h3>
@@ -655,7 +704,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               <video
                 ref={(el) => {
                    if (el) videoRef.current = el;
-                   if (el !== videoEl) setVideoEl(el);
+                   if (el && el !== videoEl) setVideoEl(el);
                 }}
                 autoPlay
                 playsInline
@@ -679,6 +728,71 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               )}
             </>
           )}
+          </div>
+
+          {/* Bottom: Hardware Optical Flow Video */}
+          <div className="flex-1 relative flex items-center justify-center bg-[#050505]">
+            <div className="absolute top-4 left-4 z-20 text-xs font-mono text-white/50 tracking-widest bg-black/40 px-3 py-1 rounded flex items-center gap-2">
+              <span>CARDBOARD HAND TRACKING {isCvReady ? '🟢' : '🔴'}</span>
+              {hwSyncScore !== null && (
+                <span className={hwSyncScore > 80 ? 'text-accent' : hwSyncScore > 50 ? 'text-yellow-400' : 'text-red-500'}>
+                  SYNC {hwSyncScore.toFixed(0)}%
+                </span>
+              )}
+            </div>
+            {isCvReady && trackingPoints.length < REQUIRED_POINTS && (
+              <div className="absolute top-4 right-4 z-20 text-xs font-mono text-accent bg-black/80 px-3 py-1 rounded animate-pulse border border-accent">
+                CLICK {POINT_LABELS[trackingPoints.length]} ({trackingPoints.length}/{REQUIRED_POINTS})
+              </div>
+            )}
+            {trackingPoints.length === REQUIRED_POINTS && (
+              <button
+                onClick={resetTracking}
+                className="absolute top-4 right-4 z-20 text-xs font-mono text-white bg-black/80 hover:bg-red-500/20 px-3 py-1 rounded border border-white/20 transition-colors"
+              >
+                RESET CALIBRATION
+              </button>
+            )}
+            <video
+              ref={(el) => {
+                 if (el) secVideoRef.current = el;
+                 if (el && el !== secVideoEl) setSecVideoEl(el);
+              }}
+              autoPlay
+              playsInline
+              muted
+              className="w-full h-full object-cover absolute top-0 left-0"
+              onClick={(e) => {
+                 if (trackingPoints.length >= REQUIRED_POINTS) return;
+                 const rect = e.currentTarget.getBoundingClientRect();
+                 const x = (e.clientX - rect.left) / rect.width;
+                 const y = (e.clientY - rect.top) / rect.height;
+                 addTrackingPoint(x, y);
+              }}
+            />
+            {/* Tracking Overlay */}
+            <svg className="w-full h-full absolute top-0 left-0 z-10 pointer-events-none">
+               {trackingPoints.map((p, i) => (
+                  <g key={`pt-${i}`}>
+                    <circle cx={`${p.x * 100}%`} cy={`${p.y * 100}%`} r={i === 0 ? 7 : 6} fill={i === 0 ? '#fbbf24' : '#06b6d4'} stroke="#ffffff" strokeWidth="2" />
+                    <text x={`${p.x * 100}%`} y={`${p.y * 100}%`} dy={-12} fill="#ffffff" fontSize="9" fontFamily="monospace" textAnchor="middle">{POINT_LABELS[i]}</text>
+                  </g>
+               ))}
+            </svg>
+            {hwFingerErrors && (
+              <div className="absolute bottom-4 left-4 z-20 flex gap-2">
+                {['T', 'I', 'M', 'R', 'P'].map((label, i) => (
+                  <div key={label} className="flex flex-col items-center gap-1 bg-black/60 px-2 py-1 rounded">
+                    <span className="text-[9px] font-mono text-white/50">{label}</span>
+                    <span className={`text-[9px] font-mono ${hwFingerErrors![i] < 30 ? 'text-accent' : hwFingerErrors![i] < 70 ? 'text-yellow-400' : 'text-red-500'}`}>
+                      ±{hwFingerErrors[i].toFixed(0)}°
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+          
         </div>
 
         {/* Right: Digital Twin (3D Rendered) */}
