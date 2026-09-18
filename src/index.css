@@ -1,0 +1,45 @@
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: 'Inter', system-ui, sans-serif;
+  --font-mono: 'JetBrains Mono', monospace;
+  
+  --color-base: #0a0a0a;
+  --color-surface: #171717;
+  --color-surface-hover: #262626;
+  
+  --color-accent: #06b6d4;
+  --color-accent-hover: #0891b2;
+  
+  --color-text-main: #f8fafc;
+  --color-text-muted: #94a3b8;
+}
+
+@layer base {
+  body {
+    background-color: var(--color-base);
+    color: var(--color-text-main);
+    font-family: var(--font-sans);
+    -webkit-font-smoothing: antialiased;
+    @apply min-h-screen flex flex-col m-0 p-0 box-border;
+  }
+
+  #root {
+    @apply flex-1 flex flex-col;
+  }
+}
+
+@layer components {
+  .panel {
+    @apply bg-surface border border-white/10 rounded-xl shadow-2xl;
+  }
+  
+  .btn-primary {
+    @apply bg-accent hover:bg-accent-hover text-black font-semibold px-6 py-3 rounded-lg transition-colors duration-200 shadow-[0_0_15px_rgba(6,182,212,0.3)] hover:shadow-[0_0_20px_rgba(6,182,212,0.5)];
+  }
+
+  .btn-secondary {
+    @apply bg-transparent border border-white/20 hover:bg-white/5 text-text-main font-medium px-6 py-3 rounded-lg transition-colors duration-200;
+  }
+}
