@@ -33,11 +33,7 @@ function App() {
             className="flex-1 flex flex-col items-center justify-center max-w-7xl mx-auto w-full px-8 gap-12"
           >
             <div className="text-center space-y-4">
-              <div className="inline-flex items-center gap-3 px-4 py-1.5 rounded-full bg-accent/10 text-accent text-sm font-mono border border-accent/20 mb-4">
-                <Activity size={16} />
-                <span>CLINICAL KINEMATIC ENGINE v2.0</span>
-              </div>
-              <h1 className="text-6xl font-semibold tracking-tight">Osmosis</h1>
+              <h1 className="text-6xl font-semibold tracking-tight">KinetiSync</h1>
               <p className="text-xl text-text-muted max-w-2xl mx-auto leading-relaxed">
                 Precision motor-skill transfer via dynamic time warping and real-time spatial path diffing.
               </p>

@@ -6,7 +6,7 @@ import { renderLiveHand, renderGhostHand } from '../utils/renderingEngine';
 import type { DtwWorkerOutput } from '../utils/dtwWorker';
 import { useHandTracking, type BiomechanicalResult } from '../hooks/useHandTracking';
 import { useVoiceControl } from '../hooks/useVoiceControl';
-import { useOpticalFlow, REQUIRED_POINTS } from '../hooks/useOpticalFlow';
+
 import { useAppStore } from '../store/useAppStore';
 import type { AttemptRecord } from '../store/useAppStore';
 import { use3DStore } from '../store/use3DStore';
@@ -20,7 +20,7 @@ interface CameraViewProps {
 }
 
 const WINDOW_SIZE = 15; // Number of frames to send to DTW worker for analysis
-const POINT_LABELS = ['PALM', 'THUMB', 'INDEX', 'MIDDLE', 'RING', 'PINKY'];
+
 
 export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
@@ -35,8 +35,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   // Recording State
   const [isRecording, setIsRecording] = useState(false);
   const isRecordingRef = useRef(false);
-  const [isWaitingForGesture, setIsWaitingForGesture] = useState(false);
-  const isWaitingForGestureRef = useRef(false);
+
   const recordingStartTimeRef = useRef<number>(0);
   const recordedFramesRef = useRef<MotionFrame[]>([]);
   
@@ -90,20 +89,59 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
           frames: [...recordedFramesRef.current],
           createdAt: Date.now()
         };
-        localStorage.setItem('osmosis_expert_profile', JSON.stringify(profile));
+        localStorage.setItem('kinetisync_expert_profile', JSON.stringify(profile));
       }
     };
   }, []);
 
-  // Setup Optical Flow for Cardboard Hand Tracking (hardware feedback)
-  const { isCvReady, trackingPoints, addTrackingPoint, resetTracking, setOnFlowResults } = useOpticalFlow(secVideoEl);
+  // Setup MediaPipe for Cardboard Hand Tracking (hardware feedback)
+  const { isModelLoaded: isSecModelLoaded, setOnResults: setSecOnResults } = useHandTracking(secVideoEl);
   const physicalFeedback = use3DStore(state => state.physicalFeedback);
   const lastCommandedAnglesRef = useRef<number[] | null>(null);
+  
+  const secCanvasRef = useRef<HTMLCanvasElement>(null);
+
   useEffect(() => {
-    setOnFlowResults((result) => {
-      use3DStore.getState().setPhysicalFeedback(result);
+    setSecOnResults((result) => {
+      const canvas = secCanvasRef.current;
+      const ctx = canvas?.getContext('2d');
+      
+      if (canvas && ctx && secVideoEl) {
+        if (canvas.width !== secVideoEl.videoWidth) {
+          canvas.width = secVideoEl.videoWidth;
+          canvas.height = secVideoEl.videoHeight;
+        }
+        
+        ctx.save();
+        ctx.clearRect(0, 0, canvas.width, canvas.height);
+        
+        if (appState !== 'VIDEO_PROCESS') {
+          ctx.translate(canvas.width, 0);
+          ctx.scale(-1, 1);
+        }
+
+        if (result.hands && result.hands.landmarks.length > 0) {
+          result.hands.landmarks.forEach(handLandmarks => {
+            renderLiveHand(ctx, handLandmarks, canvas.width, canvas.height, result.pose?.landmarks?.[0]);
+          });
+          
+          const lm = result.hands.landmarks[0];
+          const tips = [
+            { x: lm[4].x, y: lm[4].y },
+            { x: lm[8].x, y: lm[8].y },
+            { x: lm[12].x, y: lm[12].y },
+            { x: lm[16].x, y: lm[16].y },
+            { x: lm[20].x, y: lm[20].y }
+          ];
+          
+          use3DStore.getState().setPhysicalFeedback({ points: tips, angles: [0,0,0,0,0] });
+        } else {
+          use3DStore.getState().setPhysicalFeedback(null);
+        }
+        ctx.restore();
+      }
     });
-  }, [setOnFlowResults]);
+  }, [setSecOnResults, secVideoEl, appState]);
 
   // Hardware sync: how closely the cardboard hand's observed finger angles match
   // the angles we last commanded it to move to.
@@ -129,7 +167,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       }
     };
 
-    const profileJson = localStorage.getItem('osmosis_expert_profile');
+    const profileJson = localStorage.getItem('kinetisync_expert_profile');
     if (profileJson) {
       try {
         setSavedProfile(JSON.parse(profileJson));
@@ -145,10 +183,14 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
   const handleStartRecording = () => {
     if (isPlayingRef.current || isCalibratingRef.current) return;
-    setIsWaitingForGesture(true);
-    isWaitingForGestureRef.current = true;
     setIsPlaying(false);
     isPlayingRef.current = false;
+    
+    recordedFramesRef.current = [];
+    recordingStartTimeRef.current = performance.now();
+    setIsRecording(true);
+    isRecordingRef.current = true;
+    useAppStore.getState().setRecordedSession(null);
   };
   
   // Auto-start waiting for gesture when video is uploaded
@@ -157,15 +199,6 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       handleStartRecording();
     }
   }, [appState, uploadedVideoUrl]);
-  
-  const triggerRecordingStart = () => {
-    setIsWaitingForGesture(false);
-    isWaitingForGestureRef.current = false;
-    recordedFramesRef.current = [];
-    recordingStartTimeRef.current = performance.now();
-    setIsRecording(true);
-    isRecordingRef.current = true;
-  };
 
   const handleStopRecording = () => {
     setIsRecording(false);
@@ -186,14 +219,14 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       createdAt: Date.now()
     };
 
-    localStorage.setItem('osmosis_expert_profile', JSON.stringify(profile));
+    localStorage.setItem('kinetisync_expert_profile', JSON.stringify(profile));
     setSavedProfile(profile);
     setToastMsg("Expert Profile Saved Successfully!");
     setTimeout(() => setToastMsg(null), 3000);
   };
 
   const handleStartPlayback = () => {
-    if (isRecordingRef.current || isWaitingForGestureRef.current) return;
+    if (isRecordingRef.current) return;
     setIsCalibrating(true);
     isCalibratingRef.current = true;
     setCalibrationProgress(0);
@@ -247,14 +280,14 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   };
 
   const handleStopAll = () => {
-    if (isRecordingRef.current || isWaitingForGestureRef.current) handleStopRecording();
+    if (isRecordingRef.current) handleStopRecording();
     if (isPlayingRef.current || isCalibratingRef.current) handleStopPlayback();
   };
 
   const { isListening, toggleListening } = useVoiceControl({
-    'osmosis record': handleStartRecording,
-    'osmosis stop': handleStopAll,
-    'osmosis execute': handleStartPlayback,
+    'kinetisync record': handleStartRecording,
+    'kinetisync stop': handleStopAll,
+    'kinetisync execute': handleStartPlayback,
     'connect hardware': handleConnectHardware
   });
 
@@ -398,26 +431,9 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
 
       const now = performance.now();
-      // Helper to detect a Pinch gesture (Thumb tip touching Index tip)
-      const isPinching = (lms: NormalizedLandmark[]) => {
-        const dx = lms[4].x - lms[8].x;
-        const dy = lms[4].y - lms[8].y;
-        const dist = Math.sqrt(dx * dx + dy * dy);
-        return dist < 0.05; // 5% of screen/bounding box distance
-      };
 
       const hasHand = result.hands?.landmarks && result.hands.landmarks.length > 0;
       const firstPose = result.pose?.landmarks?.[0];
-
-      // 0. Wait for Pinch to start recording
-      if (isWaitingForGestureRef.current && hasHand) {
-        const hand1Pinch = isPinching(result.hands!.landmarks[0]);
-        const hand2Pinch = result.hands!.landmarks.length > 1 ? isPinching(result.hands!.landmarks[1]) : false;
-        
-        if (hand1Pinch || hand2Pinch) {
-          triggerRecordingStart();
-        }
-      }
 
       // 1. Capture Data if Recording
       if (isRecordingRef.current && hasHand) {
@@ -605,7 +621,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         
         {/* Left Side: Recording Controls */}
         <div className="flex flex-col gap-2 pointer-events-auto">
-          {!isRecording && !isWaitingForGesture ? (
+          {!isRecording ? (
             <button 
               disabled={!isModelLoaded || !isReady}
               className={`btn-secondary flex items-center gap-2 bg-black/50 backdrop-blur ${(!isModelLoaded || !isReady) ? 'opacity-50 cursor-not-allowed' : ''}`} 
@@ -614,11 +630,6 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               <CircleDashed size={16} className="text-red-500" />
               <span>RECORD EXPERT PATH</span>
             </button>
-          ) : isWaitingForGesture ? (
-            <div className="flex items-center gap-2 bg-yellow-500/20 border border-yellow-500/50 backdrop-blur text-yellow-200 px-6 py-3 rounded-lg">
-              <Activity size={16} className="animate-pulse" />
-              <span>PINCH INDEX & THUMB TO START</span>
-            </div>
           ) : (
             <button className="btn-secondary flex items-center justify-between gap-4 bg-red-950/80 border-red-500/50 backdrop-blur text-red-100 min-w-[200px]" onClick={handleStopRecording}>
               <div className="flex items-center gap-2">
@@ -733,25 +744,21 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
           {/* Bottom: Hardware Optical Flow Video */}
           <div className="flex-1 relative flex items-center justify-center bg-[#050505]">
             <div className="absolute top-4 left-4 z-20 text-xs font-mono text-white/50 tracking-widest bg-black/40 px-3 py-1 rounded flex items-center gap-2">
-              <span>CARDBOARD HAND TRACKING {isCvReady ? '🟢' : '🔴'}</span>
+              <span>CARDBOARD HAND TRACKING {isSecModelLoaded ? '🟢' : '🔴'}</span>
               {hwSyncScore !== null && (
                 <span className={hwSyncScore > 80 ? 'text-accent' : hwSyncScore > 50 ? 'text-yellow-400' : 'text-red-500'}>
                   SYNC {hwSyncScore.toFixed(0)}%
                 </span>
               )}
             </div>
-            {isCvReady && trackingPoints.length < REQUIRED_POINTS && (
-              <div className="absolute top-4 right-4 z-20 text-xs font-mono text-accent bg-black/80 px-3 py-1 rounded animate-pulse border border-accent">
-                CLICK {POINT_LABELS[trackingPoints.length]} ({trackingPoints.length}/{REQUIRED_POINTS})
+            
+            {!isSecModelLoaded && (
+              <div className="absolute inset-0 flex flex-col items-center justify-center z-20 bg-black/80 backdrop-blur-sm">
+                <div className="w-12 h-12 rounded-full border-4 border-white/10 border-t-accent animate-spin mb-4" />
+                <p className="text-text-muted font-mono tracking-widest text-xs">
+                  LOADING NEURAL ENGINE...
+                </p>
               </div>
-            )}
-            {trackingPoints.length === REQUIRED_POINTS && (
-              <button
-                onClick={resetTracking}
-                className="absolute top-4 right-4 z-20 text-xs font-mono text-white bg-black/80 hover:bg-red-500/20 px-3 py-1 rounded border border-white/20 transition-colors"
-              >
-                RESET CALIBRATION
-              </button>
             )}
             <video
               ref={(el) => {
@@ -761,24 +768,14 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               autoPlay
               playsInline
               muted
-              className="w-full h-full object-cover absolute top-0 left-0"
-              onClick={(e) => {
-                 if (trackingPoints.length >= REQUIRED_POINTS) return;
-                 const rect = e.currentTarget.getBoundingClientRect();
-                 const x = (e.clientX - rect.left) / rect.width;
-                 const y = (e.clientY - rect.top) / rect.height;
-                 addTrackingPoint(x, y);
-              }}
+              className={`w-full h-full object-cover absolute top-0 left-0 ${appState !== 'VIDEO_PROCESS' ? 'transform -scale-x-100' : ''}`}
             />
             {/* Tracking Overlay */}
-            <svg className="w-full h-full absolute top-0 left-0 z-10 pointer-events-none">
-               {trackingPoints.map((p, i) => (
-                  <g key={`pt-${i}`}>
-                    <circle cx={`${p.x * 100}%`} cy={`${p.y * 100}%`} r={i === 0 ? 7 : 6} fill={i === 0 ? '#fbbf24' : '#06b6d4'} stroke="#ffffff" strokeWidth="2" />
-                    <text x={`${p.x * 100}%`} y={`${p.y * 100}%`} dy={-12} fill="#ffffff" fontSize="9" fontFamily="monospace" textAnchor="middle">{POINT_LABELS[i]}</text>
-                  </g>
-               ))}
-            </svg>
+            <canvas
+              ref={secCanvasRef}
+              className="w-full h-full absolute top-0 left-0 z-10 pointer-events-none"
+              style={{ opacity: isSecModelLoaded ? 1 : 0 }}
+            />
             {hwFingerErrors && (
               <div className="absolute bottom-4 left-4 z-20 flex gap-2">
                 {['T', 'I', 'M', 'R', 'P'].map((label, i) => (
