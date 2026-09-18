@@ -5,11 +5,13 @@ import { normalizeHand } from '../utils/deviationEngine';
 import { renderLiveHand, renderGhostHand } from '../utils/renderingEngine';
 import type { DtwWorkerOutput } from '../utils/dtwWorker';
 import { useHandTracking, type BiomechanicalResult } from '../hooks/useHandTracking';
+import { useVoiceControl } from '../hooks/useVoiceControl';
 import { useAppStore } from '../store/useAppStore';
-import { use3DStore } from '../store/use3DStore';
 import type { AttemptRecord } from '../store/useAppStore';
-import { Activity, CircleDashed, Square, Play, SquarePlay, DatabaseBackup } from 'lucide-react';
+import { use3DStore } from '../store/use3DStore';
+import { Activity, CircleDashed, Square, Play, SquarePlay, DatabaseBackup, Cpu, Mic, MicOff } from 'lucide-react';
 import { DigitalTwin3D } from './DigitalTwin3D';
+import { hardwareBridge } from '../utils/hardwareBridge';
 
 interface CameraViewProps {
   onStreamReady?: (stream: MediaStream) => void;
@@ -44,6 +46,8 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   const playbackStartTimeRef = useRef<number>(0);
   const attemptFramesRef = useRef<MotionFrame[]>([]);
   const attemptScoresRef = useRef<{ timestamp: number; score: DtwWorkerOutput }[]>([]);
+  
+  const [isHardwareConnected, setIsHardwareConnected] = useState(false);
   
   const savedProfile = useAppStore(state => state.activeProfile);
   const setSavedProfile = useAppStore(state => state.setActiveProfile);
@@ -89,6 +93,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   }, []);
 
   const handleStartRecording = () => {
+    if (isPlayingRef.current || isCalibratingRef.current) return;
     setIsWaitingForGesture(true);
     isWaitingForGestureRef.current = true;
     setIsPlaying(false);
@@ -128,6 +133,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   };
 
   const handleStartPlayback = () => {
+    if (isRecordingRef.current || isWaitingForGestureRef.current) return;
     setIsCalibrating(true);
     isCalibratingRef.current = true;
     setCalibrationProgress(0);
@@ -171,6 +177,23 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
     setDtwScores(null);
   };
 
+  const handleConnectHardware = async () => {
+    const success = await hardwareBridge.connect();
+    setIsHardwareConnected(success);
+  };
+
+  const handleStopAll = () => {
+    if (isRecordingRef.current || isWaitingForGestureRef.current) handleStopRecording();
+    if (isPlayingRef.current || isCalibratingRef.current) handleStopPlayback();
+  };
+
+  const { isListening, toggleListening } = useVoiceControl({
+    'osmosis record': handleStartRecording,
+    'osmosis stop': handleStopAll,
+    'osmosis execute': handleStartPlayback,
+    'connect hardware': handleConnectHardware
+  });
+
   // Camera or Video Initialization
   useEffect(() => {
     if (appState === 'VIDEO_PROCESS' && uploadedVideoUrl) {
@@ -208,6 +231,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             activeStream = stream;
             videoRef.current.onloadedmetadata = () => {
               setIsReady(true);
+              videoRef.current?.play().catch(e => console.error("Auto-play prevented", e));
               if (onStreamReady) onStreamReady(stream);
             };
           }
@@ -238,10 +262,27 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       const teleCtx = teleCanvas.getContext('2d');
       if (!ctx || !teleCtx) return;
       
-      // Match canvas size to display size
+      // Match canvas size to display size, handling object-fit cover
       if (canvas.width !== canvas.clientWidth || canvas.height !== canvas.clientHeight) {
-        canvas.width = canvas.clientWidth;
-        canvas.height = canvas.clientHeight;
+        if (video.videoWidth > 0 && video.videoHeight > 0) {
+          const videoRatio = video.videoWidth / video.videoHeight;
+          const containerRatio = canvas.clientWidth / canvas.clientHeight;
+          
+          let drawWidth = canvas.clientWidth;
+          let drawHeight = canvas.clientHeight;
+          
+          if (containerRatio > videoRatio) {
+            drawHeight = canvas.clientWidth / videoRatio;
+          } else {
+            drawWidth = canvas.clientHeight * videoRatio;
+          }
+          
+          canvas.width = drawWidth;
+          canvas.height = drawHeight;
+        } else {
+          canvas.width = canvas.clientWidth;
+          canvas.height = canvas.clientHeight;
+        }
         teleCanvas.width = teleCanvas.clientWidth;
         teleCanvas.height = teleCanvas.clientHeight;
       }
@@ -394,11 +435,20 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         setDtwScores(null);
       }
 
-      // 3. Render Live Hand (On Video Canvas)
+      // 3. Render Live Hand (On Video Canvas) & Send Hardware Angles
       if (hasHand) {
+        const liveHand = result.hands!.landmarks[0];
+        
+        // Render
         result.hands!.landmarks.forEach(handLandmarks => {
           renderLiveHand(ctx, handLandmarks, canvas.width, canvas.height, firstPose);
         });
+        
+        // Transmit to ESP32 Hardware (throttle to ~30fps)
+        if (now - lastWorkerTime > 30) {
+           const angles = hardwareBridge.calculateAngles(liveHand);
+           hardwareBridge.sendAngles(angles);
+        }
       }
 
       ctx.restore();
@@ -453,6 +503,22 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
         {/* Right Side: Playback Controls */}
         <div className="flex flex-col gap-2 pointer-events-auto items-end">
+          <button 
+            className={`btn-secondary flex items-center gap-2 backdrop-blur mb-2 ${isListening ? 'border-red-500 text-red-500 bg-red-500/10' : 'border-white/20'}`}
+            onClick={toggleListening}
+          >
+            {isListening ? <Mic size={16} className="animate-pulse" /> : <MicOff size={16} className="text-white/50" />}
+            {isListening ? 'VOICE COMMAND ACTIVE' : 'ENABLE VOICE CONTROL'}
+          </button>
+          
+          <button 
+            className={`btn-secondary flex items-center gap-2 backdrop-blur mb-2 ${isHardwareConnected ? 'border-accent text-accent' : 'border-white/20'}`}
+            onClick={handleConnectHardware}
+          >
+            <Cpu size={16} className={isHardwareConnected ? "text-accent animate-pulse" : "text-white/50"} />
+            {isHardwareConnected ? 'ESP32 CONNECTED' : 'CONNECT HARDWARE'}
+          </button>
+          
           {savedProfile && (
             <>
               <div className="text-xs font-mono text-accent bg-black/60 backdrop-blur px-3 py-1 rounded-md border border-accent/20 mb-1 flex items-center gap-2">
@@ -500,7 +566,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               <canvas
                 ref={canvasRef}
                 className="w-full h-full absolute top-0 left-0 z-10 pointer-events-none"
-                style={{ opacity: isReady ? 1 : 0 }}
+                style={{ opacity: (isReady && isModelLoaded) ? 1 : 0 }}
               />
               {/* Loading Overlays */}
               {(!isReady || !isModelLoaded) && !errorMsg && (

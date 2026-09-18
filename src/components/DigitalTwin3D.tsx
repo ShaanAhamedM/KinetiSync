@@ -3,6 +3,50 @@ import { Canvas } from '@react-three/fiber';
 import { OrbitControls, Environment, Grid } from '@react-three/drei';
 import { use3DStore } from '../store/use3DStore';
 import { HandMesh3D } from './HandMesh3D';
+import * as THREE from 'three';
+import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
+
+const TensionLines = ({ live, ghost, aspectRatio }: { live: NormalizedLandmark[], ghost: NormalizedLandmark[], aspectRatio: number }) => {
+  const getVector = (lm: NormalizedLandmark) => new THREE.Vector3(
+    -(lm.x - 0.5) * 6 * aspectRatio,
+    -(lm.y - 0.5) * 6,
+    -lm.z * 6
+  );
+
+  const tips = [4, 8, 12, 16, 20];
+  
+  return (
+    <group>
+      {tips.map(tip => {
+        const p1 = getVector(live[tip]);
+        const p2 = getVector(ghost[tip]);
+        const dist = p1.distanceTo(p2);
+        
+        if (dist < 0.2) return null; // No tension if perfectly aligned
+
+        const color = new THREE.Color().lerpColors(
+          new THREE.Color('#fbbf24'),
+          new THREE.Color('#ef4444'),
+          Math.min(1, (dist - 0.2) / 1.0)
+        );
+
+        const pos = p1.clone().lerp(p2, 0.5);
+        const dir = p2.clone().sub(p1).normalize();
+        const quat = new THREE.Quaternion();
+        if (dir.lengthSq() > 0.0001) {
+           quat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
+        }
+
+        return (
+          <mesh key={`tension-${tip}`} position={pos} quaternion={quat}>
+             <cylinderGeometry args={[0.02, 0.02, dist, 8]} />
+             <meshBasicMaterial color={color} transparent opacity={0.6} />
+          </mesh>
+        );
+      })}
+    </group>
+  );
+};
 
 const DigitalTwinScene = () => {
   const liveLandmarks = use3DStore(state => state.liveLandmarks);
@@ -60,6 +104,11 @@ const DigitalTwinScene = () => {
           aspectRatio={aspectRatio}
         />
       ))}
+
+      {/* Tension Lines for Deviation */}
+      {liveLandmarks && liveLandmarks[0] && ghostLandmarks && ghostLandmarks[0] && (
+        <TensionLines live={liveLandmarks[0]} ghost={ghostLandmarks[0]} aspectRatio={aspectRatio} />
+      )}
     </>
   );
 };

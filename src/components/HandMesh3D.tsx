@@ -48,50 +48,57 @@ const getFingerFromJoint = (index: number) => {
   return 'palm';
 };
 
-const Bone = ({ start, end, color, radius = 0.15 }: { start: THREE.Vector3, end: THREE.Vector3, color: string, radius?: number }) => {
+const Bone = ({ start, end, color, radius = 0.15, isExpert = false }: { start: THREE.Vector3, end: THREE.Vector3, color: string, radius?: number, isExpert?: boolean }) => {
   const distance = start.distanceTo(end);
   const position = start.clone().lerp(end, 0.5);
   
   const quaternion = new THREE.Quaternion();
   const up = new THREE.Vector3(0, 1, 0);
   const dir = end.clone().sub(start).normalize();
-  // Ensure we don't calculate rotation for zero length
   if (dir.lengthSq() > 0.0001) {
     quaternion.setFromUnitVectors(up, dir);
   }
 
   return (
     <mesh position={position} quaternion={quaternion}>
-      <capsuleGeometry args={[radius, distance, 16, 32]} />
+      {isExpert ? (
+        <capsuleGeometry args={[radius, distance, 16, 32]} />
+      ) : (
+        <cylinderGeometry args={[radius * 0.8, radius * 0.8, distance, 6]} />
+      )}
       <meshPhysicalMaterial 
         color={color} 
         emissive={color} 
-        emissiveIntensity={0.2} 
-        roughness={0.1} 
-        metalness={0.5} 
-        transmission={0.4}
+        emissiveIntensity={isExpert ? 0.3 : 0.1} 
+        roughness={isExpert ? 0.1 : 0.6} 
+        metalness={isExpert ? 0.5 : 0.9} 
+        transmission={isExpert ? 0.4 : 0.0}
         thickness={0.5}
-        transparent
-        opacity={1}
+        transparent={isExpert}
+        opacity={isExpert ? 0.8 : 1}
       />
     </mesh>
   );
 };
 
-const Joint = ({ position, color, radius = 0.16 }: { position: THREE.Vector3, color: string, radius?: number }) => {
+const Joint = ({ position, color, radius = 0.16, isExpert = false }: { position: THREE.Vector3, color: string, radius?: number, isExpert?: boolean }) => {
   return (
     <mesh position={position}>
-      <sphereGeometry args={[radius, 32, 32]} />
+      {isExpert ? (
+        <sphereGeometry args={[radius, 32, 32]} />
+      ) : (
+        <boxGeometry args={[radius * 1.5, radius * 1.5, radius * 1.5]} />
+      )}
       <meshPhysicalMaterial 
         color={color} 
         emissive={color} 
-        emissiveIntensity={0.4}
-        roughness={0.1}
-        metalness={0.5}
-        transmission={0.4}
+        emissiveIntensity={isExpert ? 0.4 : 0.2}
+        roughness={isExpert ? 0.1 : 0.4}
+        metalness={isExpert ? 0.5 : 0.9}
+        transmission={isExpert ? 0.4 : 0.0}
         thickness={0.5}
-        transparent
-        opacity={1}
+        transparent={isExpert}
+        opacity={isExpert ? 0.8 : 1}
       />
     </mesh>
   );
@@ -121,7 +128,7 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
         // Make palm base joints slightly thicker
         const radius = (i === 0 || i === 1 || i === 5 || i === 9 || i === 13 || i === 17) ? 0.22 : 0.16;
         
-        return <Joint key={`joint-${i}`} position={v} color={color} radius={radius} />;
+        return <Joint key={`joint-${i}`} position={v} color={color} radius={radius} isExpert={isExpert} />;
       })}
 
       {/* Render Bones */}
@@ -142,7 +149,8 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
             start={vectors[startIdx]} 
             end={vectors[endIdx]} 
             color={color}
-            radius={radius} 
+            radius={radius}
+            isExpert={isExpert}
           />
         );
       })}
@@ -156,7 +164,8 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
           start={vectors[conn[0]]} 
           end={vectors[conn[1]]} 
           color={isExpert ? '#06b6d4' : '#ffffff'}
-          radius={0.2} 
+          radius={0.2}
+          isExpert={isExpert}
         />
       ))}
     </group>
