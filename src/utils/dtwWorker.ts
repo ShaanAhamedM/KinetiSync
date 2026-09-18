@@ -31,6 +31,7 @@ const FINGER_INDICES = {
 const computeFrameDistance = (frame1: NormalizedLandmark[], frame2: NormalizedLandmark[], indices: number[] = Array.from({length: 21}, (_, i) => i)) => {
   let totalDist = 0;
   for (const i of indices) {
+    if (!frame1[i] || !frame2[i]) return Infinity; // Guard against malformed frames (BUG-38)
     totalDist += calculateEuclideanDistance(frame1[i], frame2[i]);
   }
   return totalDist / indices.length;

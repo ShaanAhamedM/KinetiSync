@@ -6,44 +6,57 @@ import { HandMesh3D } from './HandMesh3D';
 import * as THREE from 'three';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 
-const TensionLines = ({ live, ghost, aspectRatio }: { live: NormalizedLandmark[], ghost: NormalizedLandmark[], aspectRatio: number }) => {
-  const getVector = (lm: NormalizedLandmark) => new THREE.Vector3(
-    -(lm.x - 0.5) * 6 * aspectRatio,
-    -(lm.y - 0.5) * 6,
-    -lm.z * 6
-  );
+const TensionLineObj = ({ liveLm, ghostLm, aspectRatio }: { liveLm: NormalizedLandmark, ghostLm: NormalizedLandmark, aspectRatio: number }) => {
+  const objRef = React.useRef({
+    p1: new THREE.Vector3(),
+    p2: new THREE.Vector3(),
+    color: new THREE.Color(),
+    colorA: new THREE.Color('#fbbf24'),
+    colorB: new THREE.Color('#ef4444'),
+    pos: new THREE.Vector3(),
+    dir: new THREE.Vector3(),
+    quat: new THREE.Quaternion(),
+    up: new THREE.Vector3(0, 1, 0)
+  });
 
+  const { p1, p2, color, colorA, colorB, pos, dir, quat, up } = objRef.current;
+
+  p1.set(-(liveLm.x - 0.5) * 6 * aspectRatio, -(liveLm.y - 0.5) * 6, -liveLm.z * 6);
+  p2.set(-(ghostLm.x - 0.5) * 6 * aspectRatio, -(ghostLm.y - 0.5) * 6, -ghostLm.z * 6);
+  
+  const dist = p1.distanceTo(p2);
+  if (dist < 0.2) return null;
+
+  color.lerpColors(colorA, colorB, Math.min(1, (dist - 0.2) / 1.0));
+  pos.copy(p1).lerp(p2, 0.5);
+  dir.copy(p2).sub(p1).normalize();
+  
+  if (dir.lengthSq() > 0.0001) {
+    quat.setFromUnitVectors(up, dir);
+  }
+
+  // Use getHex() and arrays to prevent object allocations on render (BUG-40)
+  return (
+    <mesh position={[pos.x, pos.y, pos.z]} quaternion={[quat.x, quat.y, quat.z, quat.w]}>
+       <cylinderGeometry args={[0.02, 0.02, dist, 8]} />
+       <meshBasicMaterial color={color.getHex()} transparent opacity={0.6} />
+    </mesh>
+  );
+};
+
+const TensionLines = ({ live, ghost, aspectRatio }: { live: NormalizedLandmark[], ghost: NormalizedLandmark[], aspectRatio: number }) => {
   const tips = [4, 8, 12, 16, 20];
   
   return (
     <group>
-      {tips.map(tip => {
-        const p1 = getVector(live[tip]);
-        const p2 = getVector(ghost[tip]);
-        const dist = p1.distanceTo(p2);
-        
-        if (dist < 0.2) return null; // No tension if perfectly aligned
-
-        const color = new THREE.Color().lerpColors(
-          new THREE.Color('#fbbf24'),
-          new THREE.Color('#ef4444'),
-          Math.min(1, (dist - 0.2) / 1.0)
-        );
-
-        const pos = p1.clone().lerp(p2, 0.5);
-        const dir = p2.clone().sub(p1).normalize();
-        const quat = new THREE.Quaternion();
-        if (dir.lengthSq() > 0.0001) {
-           quat.setFromUnitVectors(new THREE.Vector3(0, 1, 0), dir);
-        }
-
-        return (
-          <mesh key={`tension-${tip}`} position={pos} quaternion={quat}>
-             <cylinderGeometry args={[0.02, 0.02, dist, 8]} />
-             <meshBasicMaterial color={color} transparent opacity={0.6} />
-          </mesh>
-        );
-      })}
+      {tips.map(tip => (
+        <TensionLineObj 
+          key={`tension-${tip}`} 
+          liveLm={live[tip]} 
+          ghostLm={ghost[tip]} 
+          aspectRatio={aspectRatio} 
+        />
+      ))}
     </group>
   );
 };

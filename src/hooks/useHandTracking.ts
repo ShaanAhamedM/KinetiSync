@@ -11,6 +11,7 @@ export const useHandTracking = (videoElement: HTMLVideoElement | null) => {
   const [handLandmarker, setHandLandmarker] = useState<HandLandmarker | null>(null);
   const [poseLandmarker, setPoseLandmarker] = useState<PoseLandmarker | null>(null);
   const [isModelLoaded, setIsModelLoaded] = useState(false);
+  const [modelError, setModelError] = useState<string | null>(null);
   const requestRef = useRef<number | undefined>(undefined);
   const lastVideoTimeRef = useRef(-1);
   const onResultsRef = useRef<((result: BiomechanicalResult) => void) | undefined>(undefined);
@@ -78,8 +79,9 @@ export const useHandTracking = (videoElement: HTMLVideoElement | null) => {
           landmarker.close();
           poseModel.close();
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error("Error loading MediaPipe models:", error);
+        setModelError(error.message || "Failed to load AI models. Please check your internet connection.");
       }
     };
     loadModel();
@@ -129,5 +131,5 @@ export const useHandTracking = (videoElement: HTMLVideoElement | null) => {
     };
   }, [handLandmarker, poseLandmarker, videoElement]);
 
-  return { isModelLoaded, setOnResults };
+  return { isModelLoaded, setOnResults, modelError };
 };

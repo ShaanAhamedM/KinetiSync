@@ -22,6 +22,7 @@ const WINDOW_SIZE = 15; // Number of frames to send to DTW worker for analysis
 
 export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }) => {
   const videoRef = useRef<HTMLVideoElement>(null);
+  const [videoEl, setVideoEl] = useState<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const telemetryCanvasRef = useRef<HTMLCanvasElement>(null);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
@@ -48,6 +49,8 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   const attemptScoresRef = useRef<{ timestamp: number; score: DtwWorkerOutput }[]>([]);
   
   const [isHardwareConnected, setIsHardwareConnected] = useState(false);
+  const [toastMsg, setToastMsg] = useState<string | null>(null);
+  const [recordingTimeStr, setRecordingTimeStr] = useState('00:00');
   
   const savedProfile = useAppStore(state => state.activeProfile);
   const setSavedProfile = useAppStore(state => state.setActiveProfile);
@@ -63,7 +66,30 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   // Worker Ref
   const workerRef = useRef<Worker | null>(null);
 
-  const { isModelLoaded, setOnResults } = useHandTracking(videoRef.current);
+  const { isModelLoaded, setOnResults, modelError } = useHandTracking(videoEl);
+
+  useEffect(() => {
+    if (modelError) {
+      setErrorMsg(modelError);
+    }
+  }, [modelError]);
+
+  // Auto-save on unmount if recording (BUG-21)
+  useEffect(() => {
+    return () => {
+      if (isRecordingRef.current && recordedFramesRef.current.length > 0) {
+        const duration = recordedFramesRef.current[recordedFramesRef.current.length - 1].timestamp;
+        const profile: MotionPathProfile = {
+          id: Date.now().toString(),
+          name: `Expert Path (Auto-Saved)`,
+          duration,
+          frames: [...recordedFramesRef.current],
+          createdAt: Date.now()
+        };
+        localStorage.setItem('osmosis_expert_profile', JSON.stringify(profile));
+      }
+    };
+  }, []);
 
   // Initialize Worker and Load Profile
   useEffect(() => {
@@ -119,17 +145,26 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   const handleStopRecording = () => {
     setIsRecording(false);
     isRecordingRef.current = false;
-    if (recordedFramesRef.current.length > 0) {
-      const profile: MotionPathProfile = {
-        id: Date.now().toString(),
-        name: "Expert Path " + new Date().toLocaleTimeString(),
-        createdAt: Date.now(),
-        duration: performance.now() - recordingStartTimeRef.current,
-        frames: recordedFramesRef.current
-      };
-      localStorage.setItem('osmosis_expert_profile', JSON.stringify(profile));
-      setSavedProfile(profile);
+    if (recordedFramesRef.current.length === 0) {
+      console.warn("No frames recorded (no hand detected).");
+      setToastMsg("Error: No hand detected during recording");
+      setTimeout(() => setToastMsg(null), 3000);
+      return;
     }
+
+    const duration = recordedFramesRef.current[recordedFramesRef.current.length - 1].timestamp;
+    const profile: MotionPathProfile = {
+      id: Date.now().toString(),
+      name: `Expert Path ${new Date().toLocaleTimeString()}`,
+      duration,
+      frames: [...recordedFramesRef.current],
+      createdAt: Date.now()
+    };
+
+    localStorage.setItem('osmosis_expert_profile', JSON.stringify(profile));
+    setSavedProfile(profile);
+    setToastMsg("Expert Profile Saved Successfully!");
+    setTimeout(() => setToastMsg(null), 3000);
   };
 
   const handleStartPlayback = () => {
@@ -178,8 +213,12 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   };
 
   const handleConnectHardware = async () => {
-    const success = await hardwareBridge.connect();
-    setIsHardwareConnected(success);
+    const res = await hardwareBridge.connect();
+    setIsHardwareConnected(res.success);
+    if (!res.success && res.error && !res.error.includes("No port selected")) {
+      setToastMsg(`Hardware Error: ${res.error}`);
+      setTimeout(() => setToastMsg(null), 3000);
+    }
   };
 
   const handleStopAll = () => {
@@ -193,6 +232,23 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
     'osmosis execute': handleStartPlayback,
     'connect hardware': handleConnectHardware
   });
+
+  // Recording Timer updates
+  useEffect(() => {
+    let interval: any;
+    if (isRecording) {
+      interval = setInterval(() => {
+        const ms = performance.now() - recordingStartTimeRef.current;
+        const seconds = Math.floor(ms / 1000);
+        const mins = Math.floor(seconds / 60);
+        const secs = seconds % 60;
+        setRecordingTimeStr(`${mins.toString().padStart(2, '0')}:${secs.toString().padStart(2, '0')}`);
+      }, 100);
+    } else {
+      setRecordingTimeStr('00:00');
+    }
+    return () => clearInterval(interval);
+  }, [isRecording]);
 
   // Camera or Video Initialization
   useEffect(() => {
@@ -378,13 +434,34 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       else if (isPlayingRef.current && savedProfile && savedProfile.frames.length > 0) {
         const playbackTime = (now - playbackStartTimeRef.current) % savedProfile.duration;
         
-        // Find nearest ghost frame for rendering
-        let minDiff = Infinity;
-        for (const frame of savedProfile.frames) {
-          const diff = Math.abs(frame.timestamp - playbackTime);
-          if (diff < minDiff) {
-            minDiff = diff;
-            currentGhostFrame = frame;
+        // Find nearest ghost frame for rendering using binary search O(log n)
+        let low = 0;
+        let high = savedProfile.frames.length - 1;
+        
+        while (low <= high) {
+          const mid = Math.floor((low + high) / 2);
+          const midTime = savedProfile.frames[mid].timestamp;
+          
+          if (midTime === playbackTime) {
+            currentGhostFrame = savedProfile.frames[mid];
+            break;
+          } else if (midTime < playbackTime) {
+            low = mid + 1;
+          } else {
+            high = mid - 1;
+          }
+        }
+        
+        if (!currentGhostFrame) {
+          const lowFrame = savedProfile.frames[low];
+          const highFrame = savedProfile.frames[high];
+          
+          if (lowFrame && !highFrame) currentGhostFrame = lowFrame;
+          else if (!lowFrame && highFrame) currentGhostFrame = highFrame;
+          else if (lowFrame && highFrame) {
+             const lowDiff = Math.abs(lowFrame.timestamp - playbackTime);
+             const highDiff = Math.abs(highFrame.timestamp - playbackTime);
+             currentGhostFrame = lowDiff < highDiff ? lowFrame : highFrame;
           }
         }
 
@@ -483,7 +560,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         {/* Left Side: Recording Controls */}
         <div className="flex flex-col gap-2 pointer-events-auto">
           {!isRecording && !isWaitingForGesture ? (
-            <button className="btn-secondary flex items-center gap-2 bg-black/50 backdrop-blur" onClick={handleStartRecording}>
+            <button 
+              disabled={!isModelLoaded || !isReady}
+              className={`btn-secondary flex items-center gap-2 bg-black/50 backdrop-blur ${(!isModelLoaded || !isReady) ? 'opacity-50 cursor-not-allowed' : ''}`} 
+              onClick={handleStartRecording}
+            >
               <CircleDashed size={16} className="text-red-500" />
               <span>RECORD EXPERT PATH</span>
             </button>
@@ -493,10 +574,15 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               <span>PINCH INDEX & THUMB TO START</span>
             </div>
           ) : (
-            <button className="btn-secondary flex items-center gap-2 bg-red-950/80 border-red-500/50 backdrop-blur text-red-100" onClick={handleStopRecording}>
-              <Square size={16} className="text-red-500 fill-red-500" />
-              <span>STOP RECORDING</span>
-              <span className="ml-2 w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+            <button className="btn-secondary flex items-center justify-between gap-4 bg-red-950/80 border-red-500/50 backdrop-blur text-red-100 min-w-[200px]" onClick={handleStopRecording}>
+              <div className="flex items-center gap-2">
+                <Square size={16} className="text-red-500 fill-red-500" />
+                <span>STOP RECORDING</span>
+              </div>
+              <div className="flex items-center gap-2 font-mono text-sm">
+                <span>{recordingTimeStr}</span>
+                <span className="w-2 h-2 rounded-full bg-red-500 animate-pulse" />
+              </div>
             </button>
           )}
         </div>
@@ -526,7 +612,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
                 EXPERT PROFILE LOADED
               </div>
               {(!isPlaying && !isCalibrating) && (
-                <button className="btn-primary flex items-center gap-2" onClick={handleStartPlayback}>
+                <button 
+                  disabled={!isModelLoaded || !isReady}
+                  className={`btn-primary flex items-center gap-2 ${(!isModelLoaded || !isReady) ? 'opacity-50 cursor-not-allowed' : ''}`} 
+                  onClick={handleStartPlayback}
+                >
                   <Play size={16} className="fill-black" />
                   INITIATE DIFFING
                 </button>
@@ -542,6 +632,13 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         </div>
       </div>
 
+      {/* Toast Notification */}
+      {toastMsg && (
+        <div className="absolute top-20 left-1/2 transform -translate-x-1/2 z-[100] bg-black/80 border border-accent/50 text-white px-6 py-3 rounded-lg shadow-2xl backdrop-blur">
+          {toastMsg}
+        </div>
+      )}
+
       {/* Main Workspace Split */}
       <div className="flex-1 flex flex-row relative">
         
@@ -556,7 +653,10 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             <>
               <div className="absolute top-4 left-4 z-20 text-xs font-mono text-white/50 tracking-widest bg-black/40 px-3 py-1 rounded">ORIGINAL VIDEO</div>
               <video
-                ref={videoRef}
+                ref={(el) => {
+                   if (el) videoRef.current = el;
+                   if (el !== videoEl) setVideoEl(el);
+                }}
                 autoPlay
                 playsInline
                 muted

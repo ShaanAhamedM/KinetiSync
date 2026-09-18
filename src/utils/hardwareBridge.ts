@@ -18,11 +18,12 @@ export class HardwareBridge {
   private port: SerialPort | null = null;
   private writer: WritableStreamDefaultWriter<Uint8Array> | null = null;
   public isConnected: boolean = false;
+  private isWriting: boolean = false;
 
-  async connect() {
+  async connect(): Promise<{ success: boolean; error?: string }> {
     if (!('serial' in navigator)) {
       console.warn('WebSerial API not supported in this browser.');
-      return false;
+      return { success: false, error: 'WebSerial API not supported in this browser.' };
     }
 
     try {
@@ -31,11 +32,11 @@ export class HardwareBridge {
       this.writer = this.port.writable?.getWriter() ?? null;
       this.isConnected = true;
       console.log('Hardware connected successfully via WebSerial');
-      return true;
-    } catch (e) {
+      return { success: true };
+    } catch (e: any) {
       console.error('Failed to connect to hardware:', e);
       this.isConnected = false;
-      return false;
+      return { success: false, error: e.message || 'Connection failed' };
     }
   }
 
@@ -78,16 +79,19 @@ export class HardwareBridge {
   }
 
   async sendAngles(angles: number[]) {
-    // Format: "thumb,index,middle,ring,pinky\n"
+    // Drop frames if previous write is still pending (Backpressure Prevention)
+    if (!this.isConnected || !this.writer || this.isWriting) return;
+
+    this.isWriting = true;
     const dataString = angles.join(',') + '\n';
 
-    if (this.isConnected && this.writer) {
-      try {
-        const encoder = new TextEncoder();
-        await this.writer.write(encoder.encode(dataString));
-      } catch (e) {
-        console.error("Hardware transmission error:", e);
-      }
+    try {
+      const encoder = new TextEncoder();
+      await this.writer.write(encoder.encode(dataString));
+    } catch (e) {
+      console.error("Hardware transmission error:", e);
+    } finally {
+      this.isWriting = false;
     }
   }
 }
