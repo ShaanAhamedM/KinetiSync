@@ -626,7 +626,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
           renderLiveHand(ctx, handLandmarks, canvas.width, canvas.height, firstPose);
         });
         
-        // Transmit to ESP32 Hardware (throttle to ~30fps)
+        // Transmit to Arduino Hardware (throttle to ~30fps)
         if (now - lastWorkerTime > 30) {
            const angles = hardwareBridge.calculateAngles(liveHand);
            lastCommandedAnglesRef.current = angles;
@@ -703,7 +703,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             onClick={handleConnectHardware}
           >
             <Cpu size={16} className={isHardwareConnected ? "text-accent animate-pulse" : "text-white/50"} />
-            {isHardwareConnected ? 'ESP32 CONNECTED' : 'CONNECT HARDWARE'}
+            {isHardwareConnected ? 'ARDUINO CONNECTED' : 'CONNECT HARDWARE'}
           </button>
           
           {savedProfile && (
