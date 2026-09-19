@@ -64,11 +64,7 @@ const Bone = ({ start, end, color, radius = 0.15, isExpert = false }: { start: T
 
   return (
     <mesh position={position} quaternion={quaternion}>
-      {isExpert ? (
-        <capsuleGeometry args={[radius, distance, 16, 32]} />
-      ) : (
-        <cylinderGeometry args={[radius * 0.8, radius * 0.8, distance, 6]} />
-      )}
+      <capsuleGeometry args={[radius, distance, 16, 32]} />
       <meshPhysicalMaterial 
         color={color} 
         emissive={color} 
@@ -87,11 +83,7 @@ const Bone = ({ start, end, color, radius = 0.15, isExpert = false }: { start: T
 const Joint = ({ position, color, radius = 0.16, isExpert = false }: { position: THREE.Vector3, color: string, radius?: number, isExpert?: boolean }) => {
   return (
     <mesh position={position}>
-      {isExpert ? (
-        <sphereGeometry args={[radius, 32, 32]} />
-      ) : (
-        <boxGeometry args={[radius * 1.5, radius * 1.5, radius * 1.5]} />
-      )}
+      <sphereGeometry args={[radius, 32, 32]} />
       <meshPhysicalMaterial 
         color={color} 
         emissive={color} 
