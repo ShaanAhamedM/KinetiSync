@@ -13,6 +13,9 @@ interface HandMesh3DProps {
     pinky: number;
   } | null;
   aspectRatio?: number;
+  // Forces a fixed color for every joint/bone, bypassing score-based coloring
+  // (used for the cardboard hand's hardware feedback twin).
+  colorOverride?: string;
 }
 
 // MediaPipe Hand Connection Graph
@@ -104,7 +107,7 @@ const Joint = ({ position, color, radius = 0.16, isExpert = false }: { position:
   );
 };
 
-export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = false, fingerScores = null, aspectRatio = 1 }) => {
+export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = false, fingerScores = null, aspectRatio = 1, colorOverride }) => {
   // Convert MediaPipe landmarks (normalized 0-1) to ThreeJS World Space (-3 to 3 approx)
   const vectors = useMemo(() => {
     return landmarks.map(lm => {
@@ -123,7 +126,7 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
       {vectors.map((v, i) => {
         const finger = getFingerFromJoint(i);
         const score = fingerScores ? fingerScores[finger as keyof typeof fingerScores] : undefined;
-        const color = getScoreColor(score, isExpert);
+        const color = colorOverride ?? getScoreColor(score, isExpert);
         
         // Make palm base joints slightly thicker
         const radius = (i === 0 || i === 1 || i === 5 || i === 9 || i === 13 || i === 17) ? 0.22 : 0.16;
@@ -138,7 +141,7 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
         
         const finger = getFingerFromJoint(endIdx);
         const score = fingerScores ? fingerScores[finger as keyof typeof fingerScores] : undefined;
-        const color = getScoreColor(score, isExpert);
+        const color = colorOverride ?? getScoreColor(score, isExpert);
         
         // Thicker bones for the palm area, tapering for fingers
         const radius = (startIdx === 0 || endIdx === 0 || endIdx === 1 || endIdx === 5 || endIdx === 9 || endIdx === 13 || endIdx === 17) ? 0.2 : 0.14;
@@ -161,9 +164,9 @@ export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = fa
       ].map((conn, idx) => (
         <Bone 
           key={`webbing-${idx}`} 
-          start={vectors[conn[0]]} 
-          end={vectors[conn[1]]} 
-          color={isExpert ? '#06b6d4' : '#ffffff'}
+          start={vectors[conn[0]]}
+          end={vectors[conn[1]]}
+          color={colorOverride ?? (isExpert ? '#06b6d4' : '#ffffff')}
           radius={0.2}
           isExpert={isExpert}
         />

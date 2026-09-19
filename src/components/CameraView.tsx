@@ -60,7 +60,17 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   const appState = useAppStore(state => state.appState);
   const uploadedVideoUrl = useAppStore(state => state.uploadedVideoUrl);
   const setAppState = useAppStore(state => state.setAppState);
-  
+
+  // Declared early (rather than beside the other playback handlers below) so the
+  // cardboard-camera calibration effect can reference it without a forward-declaration.
+  const triggerPlayback = () => {
+    setIsCalibrating(false);
+    isCalibratingRef.current = false;
+    playbackStartTimeRef.current = performance.now();
+    setIsPlaying(true);
+    isPlayingRef.current = true;
+  };
+
   // Live Data tracking for DTW
   const recentLiveFramesRef = useRef<NormalizedLandmark[][]>([]);
   const [dtwScores, setDtwScores] = useState<DtwWorkerOutput | null>(null);
@@ -120,12 +130,64 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
           ctx.scale(-1, 1);
         }
 
-        if (result.hands && result.hands.landmarks.length > 0) {
-          result.hands.landmarks.forEach(handLandmarks => {
+        const hasCardboardHand = result.hands && result.hands.landmarks.length > 0;
+
+        // Calibration target: the cardboard hand (via the phone/Camo camera) must align
+        // with the recorded expert profile's first frame, not the trainee's live webcam hand.
+        if (isCalibratingRef.current && savedProfile && savedProfile.frames.length > 0) {
+          const ghostFrame = savedProfile.frames[0];
+
+          if (ghostFrame.landmarks.length > 0) {
+            ghostFrame.landmarks.forEach(handLandmarks => {
+              renderGhostHand(ctx, handLandmarks, canvas.width, canvas.height, 50, ghostFrame.poseLandmarks?.[0]); // score 50 = yellow
+            });
+          }
+
+          if (hasCardboardHand) {
+            // The cardboard/Camo camera and the camera that recorded the expert profile have
+            // different framing, zoom and distance to the hand, so raw on-screen (x, y) positions
+            // are never comparable across the two feeds -- a perfect pose match would still read
+            // as "far apart". Normalize both hands (wrist-relative, scaled by hand size) so the
+            // comparison measures hand SHAPE instead of screen position.
+            const cardboardLms = normalizeHand(result.hands!.landmarks[0]);
+            const ghostLms = normalizeHand(ghostFrame.landmarks[0]);
+
+            let totalDist = 0;
+            for (let i = 0; i < 21; i++) {
+              const dx = cardboardLms[i].x - ghostLms[i].x;
+              const dy = cardboardLms[i].y - ghostLms[i].y;
+              totalDist += Math.sqrt(dx * dx + dy * dy);
+            }
+            const avgDist = totalDist / 21;
+            const now = performance.now();
+
+            // Threshold is in normalized (wrist-to-MCP = 1 unit) space, not raw screen space,
+            // so it's a different scale than the old raw-pixel threshold.
+            if (avgDist < 0.3) {
+              if (calibrationHoldStartRef.current === 0) calibrationHoldStartRef.current = now;
+              const holdDuration = now - calibrationHoldStartRef.current;
+              const progress = Math.min(100, (holdDuration / 2000) * 100); // 2 second hold
+              setCalibrationProgress(progress);
+
+              if (progress >= 100) {
+                triggerPlayback();
+              }
+            } else {
+              calibrationHoldStartRef.current = 0;
+              setCalibrationProgress(0);
+            }
+          } else {
+            calibrationHoldStartRef.current = 0;
+            setCalibrationProgress(0);
+          }
+        }
+
+        if (hasCardboardHand) {
+          result.hands!.landmarks.forEach(handLandmarks => {
             renderLiveHand(ctx, handLandmarks, canvas.width, canvas.height, result.pose?.landmarks?.[0]);
           });
-          
-          const lm = result.hands.landmarks[0];
+
+          const lm = result.hands!.landmarks[0];
           const tips = [
             { x: lm[4].x, y: lm[4].y },
             { x: lm[8].x, y: lm[8].y },
@@ -133,15 +195,17 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             { x: lm[16].x, y: lm[16].y },
             { x: lm[20].x, y: lm[20].y }
           ];
-          
+
           use3DStore.getState().setPhysicalFeedback({ points: tips, angles: [0,0,0,0,0] });
+          use3DStore.getState().setCardboardFrameData(result.hands!.landmarks, canvas.width / canvas.height);
         } else {
           use3DStore.getState().setPhysicalFeedback(null);
+          use3DStore.getState().setCardboardFrameData(null);
         }
         ctx.restore();
       }
     });
-  }, [setSecOnResults, secVideoEl, appState]);
+  }, [setSecOnResults, secVideoEl, appState, savedProfile]);
 
   // Hardware sync: how closely the cardboard hand's observed finger angles match
   // the angles we last commanded it to move to.
@@ -239,15 +303,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
     setIsRecording(false);
     isRecordingRef.current = false;
   };
-  
-  const triggerPlayback = () => {
-    setIsCalibrating(false);
-    isCalibratingRef.current = false;
-    playbackStartTimeRef.current = performance.now();
-    setIsPlaying(true);
-    isPlayingRef.current = true;
-  };
-  
+
   const handleStopPlayback = () => {
     setIsCalibrating(false);
     isCalibratingRef.current = false;
@@ -333,12 +389,35 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       };
     } else {
       let activeStream: MediaStream | null = null;
+      let secStream: MediaStream | null = null;
       const startCamera = async () => {
         try {
-          const stream = await navigator.mediaDevices.getUserMedia({
+          // Request generic access first so device labels are populated for enumeration below.
+          const initialStream = await navigator.mediaDevices.getUserMedia({
             video: { width: { ideal: 1280 }, height: { ideal: 720 }, facingMode: 'user', frameRate: { ideal: 30 } },
             audio: false,
           });
+
+          const devices = await navigator.mediaDevices.enumerateDevices();
+          const videoInputs = devices.filter(d => d.kind === 'videoinput');
+          const camoDevice = videoInputs.find(d => d.label.toLowerCase().includes('camo'));
+          const primaryDevice = videoInputs.find(d => d !== camoDevice) ?? videoInputs[0];
+
+          // Re-acquire the primary (laptop) camera by explicit deviceId so it never
+          // accidentally lands on the Camo virtual camera.
+          let stream = initialStream;
+          if (primaryDevice && primaryDevice.deviceId && (!camoDevice || initialStream.getVideoTracks()[0]?.label !== primaryDevice.label)) {
+            try {
+              const pinnedStream = await navigator.mediaDevices.getUserMedia({
+                video: { deviceId: { exact: primaryDevice.deviceId }, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+                audio: false,
+              });
+              initialStream.getTracks().forEach(track => track.stop());
+              stream = pinnedStream;
+            } catch (pinError) {
+              console.warn("Could not pin primary camera, using default stream", pinError);
+            }
+          }
 
           if (videoRef.current) {
             videoRef.current.srcObject = stream;
@@ -350,24 +429,24 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             };
           }
 
-          // Attempt to grab a secondary camera for hardware tracking
+          // Bottom-left "cardboard hand" feed: always the Camo (phone) camera when present.
           try {
-            const devices = await navigator.mediaDevices.enumerateDevices();
-            const videoInputs = devices.filter(d => d.kind === 'videoinput');
-            if (videoInputs.length > 1) {
-              const secStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: videoInputs[1].deviceId } });
+            if (camoDevice) {
+              secStream = await navigator.mediaDevices.getUserMedia({ video: { deviceId: { exact: camoDevice.deviceId } } });
               if (secVideoRef.current) {
                 secVideoRef.current.srcObject = secStream;
                 secVideoRef.current.play().catch(e => console.error("Secondary auto-play prevented", e));
               }
             } else {
+              console.warn("Camo Camera not found among video inputs; falling back to primary feed clone.");
+              secStream = stream.clone();
               if (secVideoRef.current) {
-                secVideoRef.current.srcObject = stream.clone();
+                secVideoRef.current.srcObject = secStream;
                 secVideoRef.current.play().catch(e => console.error("Secondary auto-play prevented", e));
               }
             }
           } catch (secError) {
-            console.warn("Could not attach secondary camera", secError);
+            console.warn("Could not attach secondary (Camo) camera", secError);
           }
         } catch (err: any) {
           const msg = err.name === 'NotAllowedError' ? "Camera access denied." : "Could not access camera.";
@@ -378,6 +457,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       startCamera();
       return () => {
         if (activeStream) activeStream.getTracks().forEach(track => track.stop());
+        if (secStream) secStream.getTracks().forEach(track => track.stop());
       };
     }
   }, [appState, uploadedVideoUrl, onStreamReady, onError]);
@@ -448,47 +528,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       let currentGhostFrame: MotionFrame | null = null;
       
       // -- CALIBRATION PHASE --
+      // Alignment gating now happens against the cardboard hand's camera feed (see the
+      // secondary useHandTracking effect above); here we just keep the ghost frame pinned
+      // to frame 0 so the Digital Twin's ghost hand stays visible during calibration.
       if (isCalibratingRef.current && savedProfile && savedProfile.frames.length > 0) {
         currentGhostFrame = savedProfile.frames[0];
-        
-        // Render Ghost Hand as yellow/amber during calibration
-        if (currentGhostFrame && currentGhostFrame.landmarks.length > 0) {
-          currentGhostFrame.landmarks.forEach(handLandmarks => {
-            renderGhostHand(ctx, handLandmarks, canvas.width, canvas.height, 50, currentGhostFrame?.poseLandmarks?.[0]); // score 50 = yellow
-          });
-        }
-        
-        if (hasHand) {
-          // Calculate screen-space Euclidean distance for strict AR alignment
-          const liveLms = result.hands!.landmarks[0];
-          const ghostLms = currentGhostFrame.landmarks[0];
-          
-          let totalDist = 0;
-          for (let i = 0; i < 21; i++) {
-            const dx = liveLms[i].x - ghostLms[i].x;
-            const dy = liveLms[i].y - ghostLms[i].y;
-            totalDist += Math.sqrt(dx*dx + dy*dy);
-          }
-          const avgDist = totalDist / 21;
-          
-          // If aligned (avg distance < threshold), advance timer
-          if (avgDist < 0.05) { 
-            if (calibrationHoldStartRef.current === 0) calibrationHoldStartRef.current = now;
-            const holdDuration = now - calibrationHoldStartRef.current;
-            const progress = Math.min(100, (holdDuration / 2000) * 100); // 2 second hold
-            setCalibrationProgress(progress);
-            
-            if (progress >= 100) {
-              triggerPlayback();
-            }
-          } else {
-            calibrationHoldStartRef.current = 0;
-            setCalibrationProgress(0);
-          }
-        } else {
-          calibrationHoldStartRef.current = 0;
-          setCalibrationProgress(0);
-        }
       }
 
       // -- PLAYBACK PHASE --
@@ -795,6 +839,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         {/* Right: Digital Twin (3D Rendered) */}
         <div className="flex-1 relative bg-[#0a0a0c] overflow-hidden flex items-center justify-center">
            <div className="absolute top-4 left-4 z-20 text-xs font-mono text-white/50 tracking-widest bg-white/5 px-3 py-1 rounded border border-white/10 backdrop-blur">DIGITAL TWIN (WebGL)</div>
+           <div className="absolute top-4 right-4 z-20 flex flex-col gap-1 text-[9px] font-mono text-white/50 bg-white/5 px-3 py-2 rounded border border-white/10 backdrop-blur">
+             <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-white" />LIVE HAND</div>
+             <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full" style={{ backgroundColor: '#f97316' }} />CARDBOARD HAND</div>
+             {savedProfile && <div className="flex items-center gap-2"><span className="w-2 h-2 rounded-full bg-accent" />EXPERT GHOST</div>}
+           </div>
            {/* Grid Background */}
            <div className="absolute inset-0 bg-[linear-gradient(rgba(255,255,255,0.02)_1px,transparent_1px),linear-gradient(90deg,rgba(255,255,255,0.02)_1px,transparent_1px)] bg-[size:40px_40px] pointer-events-none" />
            <DigitalTwin3D />

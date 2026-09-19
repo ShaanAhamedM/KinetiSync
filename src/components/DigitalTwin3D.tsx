@@ -64,8 +64,10 @@ const TensionLines = ({ live, ghost, aspectRatio }: { live: NormalizedLandmark[]
 const DigitalTwinScene = () => {
   const liveLandmarks = use3DStore(state => state.liveLandmarks);
   const ghostLandmarks = use3DStore(state => state.ghostLandmarks);
+  const cardboardLandmarks = use3DStore(state => state.cardboardLandmarks);
   const dtwScores = use3DStore(state => state.dtwScores);
   const aspectRatio = use3DStore(state => state.aspectRatio);
+  const cardboardAspectRatio = use3DStore(state => state.cardboardAspectRatio);
 
   return (
     <>
@@ -110,11 +112,22 @@ const DigitalTwinScene = () => {
 
       {/* Expert Ghost Hands */}
       {ghostLandmarks && ghostLandmarks.map((hand, idx) => (
-        <HandMesh3D 
-          key={`ghost-${idx}`} 
-          landmarks={hand} 
+        <HandMesh3D
+          key={`ghost-${idx}`}
+          landmarks={hand}
           isExpert={true}
           aspectRatio={aspectRatio}
+        />
+      ))}
+
+      {/* Cardboard Hand (hardware feedback, tracked via the Camo phone camera) */}
+      {cardboardLandmarks && cardboardLandmarks.map((hand, idx) => (
+        <HandMesh3D
+          key={`cardboard-${idx}`}
+          landmarks={hand}
+          isExpert={false}
+          colorOverride="#f97316"
+          aspectRatio={cardboardAspectRatio}
         />
       ))}
 

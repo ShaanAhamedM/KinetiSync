@@ -11,19 +11,25 @@ export interface PhysicalFeedback {
 interface ThreeDState {
   liveLandmarks: NormalizedLandmark[][] | null;
   ghostLandmarks: NormalizedLandmark[][] | null;
+  cardboardLandmarks: NormalizedLandmark[][] | null;
   dtwScores: DtwWorkerOutput | null;
   physicalFeedback: PhysicalFeedback | null;
   aspectRatio: number;
+  cardboardAspectRatio: number;
   setFrameData: (live: NormalizedLandmark[][] | null, ghost: NormalizedLandmark[][] | null, scores: DtwWorkerOutput | null, aspectRatio?: number) => void;
-  setPhysicalFeedback: (feedback: PhysicalFeedback) => void;
+  setCardboardFrameData: (landmarks: NormalizedLandmark[][] | null, aspectRatio?: number) => void;
+  setPhysicalFeedback: (feedback: PhysicalFeedback | null) => void;
 }
 
 export const use3DStore = create<ThreeDState>((set) => ({
   liveLandmarks: null,
   ghostLandmarks: null,
+  cardboardLandmarks: null,
   dtwScores: null,
   physicalFeedback: null,
   aspectRatio: 1,
+  cardboardAspectRatio: 1,
   setFrameData: (live, ghost, scores, aspectRatio = 1) => set({ liveLandmarks: live, ghostLandmarks: ghost, dtwScores: scores, aspectRatio }),
+  setCardboardFrameData: (landmarks, aspectRatio = 1) => set({ cardboardLandmarks: landmarks, cardboardAspectRatio: aspectRatio }),
   setPhysicalFeedback: (feedback) => set({ physicalFeedback: feedback })
 }));
