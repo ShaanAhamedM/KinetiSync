@@ -16,6 +16,11 @@ interface HandMesh3DProps {
   // Forces a fixed color for every joint/bone, bypassing score-based coloring
   // (used for the cardboard hand's hardware feedback twin).
   colorOverride?: string;
+  // The live/ghost hands come from a front-facing selfie camera, so their X axis is
+  // flipped to match the mirrored video the user sees. The cardboard hand is filmed by
+  // a separate camera pointed AT the hand (not a user-facing mirror view), so applying
+  // that same flip makes it appear left-right reversed - set this to false to skip it.
+  mirrorX?: boolean;
 }
 
 // MediaPipe Hand Connection Graph
@@ -99,18 +104,19 @@ const Joint = ({ position, color, radius = 0.16, isExpert = false }: { position:
   );
 };
 
-export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = false, fingerScores = null, aspectRatio = 1, colorOverride }) => {
+export const HandMesh3D: React.FC<HandMesh3DProps> = ({ landmarks, isExpert = false, fingerScores = null, aspectRatio = 1, colorOverride, mirrorX = true }) => {
   // Convert MediaPipe landmarks (normalized 0-1) to ThreeJS World Space (-3 to 3 approx)
   const vectors = useMemo(() => {
+    const xSign = mirrorX ? -1 : 1;
     return landmarks.map(lm => {
       // Multiply X by aspect ratio to fix stretching on non-square video feeds (like mobile)
       return new THREE.Vector3(
-        -(lm.x - 0.5) * 6 * aspectRatio, // Flipped X to match mirror video
+        xSign * (lm.x - 0.5) * 6 * aspectRatio, // Flipped X to match mirror video (unless mirrorX is disabled)
         -(lm.y - 0.5) * 6,
         -lm.z * 6
       );
     });
-  }, [landmarks, aspectRatio]);
+  }, [landmarks, aspectRatio, mirrorX]);
 
   return (
     <group>

@@ -2,7 +2,7 @@ import React, { useEffect, useRef, useState } from 'react';
 import type { NormalizedLandmark } from '@mediapipe/tasks-vision';
 import type { MotionFrame, MotionPathProfile } from '../types/MotionPath';
 import { normalizeHand } from '../utils/deviationEngine';
-import { renderLiveHand, renderGhostHand } from '../utils/renderingEngine';
+import { renderLiveHand, renderGhostHand, renderTelemetryWaveform } from '../utils/renderingEngine';
 import type { DtwWorkerOutput } from '../utils/dtwWorker';
 import { useHandTracking, type BiomechanicalResult } from '../hooks/useHandTracking';
 import { useVoiceControl } from '../hooks/useVoiceControl';
@@ -10,7 +10,7 @@ import { useVoiceControl } from '../hooks/useVoiceControl';
 import { useAppStore } from '../store/useAppStore';
 import type { AttemptRecord } from '../store/useAppStore';
 import { use3DStore } from '../store/use3DStore';
-import { Activity, CircleDashed, Square, Play, SquarePlay, DatabaseBackup, Cpu, Mic, MicOff } from 'lucide-react';
+import { CircleDashed, Square, Play, SquarePlay, DatabaseBackup, Cpu, Mic, MicOff } from 'lucide-react';
 import { DigitalTwin3D } from './DigitalTwin3D';
 import { hardwareBridge } from '../utils/hardwareBridge';
 
@@ -20,6 +20,34 @@ interface CameraViewProps {
 }
 
 const WINDOW_SIZE = 15; // Number of frames to send to DTW worker for analysis
+
+// Binary search for the recorded expert frame closest to `playbackTime` (ms into the loop).
+// Shared by both the trainee-webcam loop and the cardboard-camera loop so either one can
+// look up "what should the hand be doing right now" independently.
+const findGhostFrame = (frames: MotionFrame[], playbackTime: number): MotionFrame | null => {
+  let low = 0;
+  let high = frames.length - 1;
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const midTime = frames[mid].timestamp;
+
+    if (midTime === playbackTime) return frames[mid];
+    else if (midTime < playbackTime) low = mid + 1;
+    else high = mid - 1;
+  }
+
+  const lowFrame = frames[low];
+  const highFrame = frames[high];
+  if (lowFrame && !highFrame) return lowFrame;
+  if (!lowFrame && highFrame) return highFrame;
+  if (lowFrame && highFrame) {
+    const lowDiff = Math.abs(lowFrame.timestamp - playbackTime);
+    const highDiff = Math.abs(highFrame.timestamp - playbackTime);
+    return lowDiff < highDiff ? lowFrame : highFrame;
+  }
+  return null;
+};
 
 
 export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }) => {
@@ -40,11 +68,11 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   const recordedFramesRef = useRef<MotionFrame[]>([]);
   
   // Playback & Attempt State
-  const [isCalibrating, setIsCalibrating] = useState(false);
-  const isCalibratingRef = useRef(false);
-  const [calibrationProgress, setCalibrationProgress] = useState(0);
-  const calibrationHoldStartRef = useRef<number>(0);
-  
+  const [isCountingDown, setIsCountingDown] = useState(false);
+  const isCountingDownRef = useRef(false);
+  const [countdownValue, setCountdownValue] = useState(5);
+  const countdownTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
   const [isPlaying, setIsPlaying] = useState(false);
   const isPlayingRef = useRef(false);
   const playbackStartTimeRef = useRef<number>(0);
@@ -64,20 +92,65 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   // Declared early (rather than beside the other playback handlers below) so the
   // cardboard-camera calibration effect can reference it without a forward-declaration.
   const triggerPlayback = () => {
-    setIsCalibrating(false);
-    isCalibratingRef.current = false;
+    setIsCountingDown(false);
+    isCountingDownRef.current = false;
     playbackStartTimeRef.current = performance.now();
     setIsPlaying(true);
     isPlayingRef.current = true;
   };
 
-  // Live Data tracking for DTW
+  // Live Data tracking for DTW.
+  // dtwScoresRef mirrors the dtwScores state for the tracking-loop closure below to read -
+  // that closure needs the CURRENT score every frame, but depending on the `dtwScores` state
+  // directly would tear down and rebuild the whole tracking effect (and reset its throttle
+  // timers) on every single worker message (~10x/sec during playback). The ref sidesteps that.
   const recentLiveFramesRef = useRef<NormalizedLandmark[][]>([]);
   const [dtwScores, setDtwScores] = useState<DtwWorkerOutput | null>(null);
+  const dtwScoresRef = useRef<DtwWorkerOutput | null>(null);
   const telemetryHistoryRef = useRef<number[]>([]);
-  
+  // Shared across BOTH camera loops (trainee webcam and cardboard/phone camera) so that
+  // whichever one currently has a hand in frame can drive the diffing score - some demo
+  // setups only have the cardboard hand active with nobody in front of the main webcam.
+  const lastDtwDispatchTimeRef = useRef(0);
+
   // Worker Ref
   const workerRef = useRef<Worker | null>(null);
+
+  // Pushes a hand's frame into the DTW comparison window and dispatches to the worker,
+  // throttled to ~10fps. Called from either camera loop with whichever hand is available.
+  const dispatchDtwFrame = (
+    handLandmarks: NormalizedLandmark[][],
+    poseLandmarks: NormalizedLandmark[][] | undefined,
+    playbackTime: number,
+    ghostFrames: MotionFrame[],
+    now: number
+  ) => {
+    if (now - lastDtwDispatchTimeRef.current <= 100) return;
+
+    attemptFramesRef.current.push({
+      timestamp: playbackTime,
+      landmarks: handLandmarks,
+      poseLandmarks
+    });
+
+    const normalizedLive = normalizeHand(handLandmarks[0]);
+    recentLiveFramesRef.current.push(normalizedLive);
+    if (recentLiveFramesRef.current.length > WINDOW_SIZE) {
+      recentLiveFramesRef.current.shift();
+    }
+
+    const ghostWindow = ghostFrames
+      .filter(f => Math.abs(f.timestamp - playbackTime) < 500) // +/- 500ms
+      .map(f => normalizeHand(f.landmarks[0]));
+
+    if (recentLiveFramesRef.current.length > 5 && ghostWindow.length > 5) {
+      workerRef.current?.postMessage({
+        liveWindow: [...recentLiveFramesRef.current],
+        ghostWindow
+      });
+      lastDtwDispatchTimeRef.current = now;
+    }
+  };
 
   const { isModelLoaded, setOnResults, modelError } = useHandTracking(videoEl);
 
@@ -104,8 +177,16 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
     };
   }, []);
 
-  // Setup MediaPipe for Cardboard Hand Tracking (hardware feedback)
-  const { isModelLoaded: isSecModelLoaded, setOnResults: setSecOnResults } = useHandTracking(secVideoEl);
+  // Setup MediaPipe for Cardboard Hand Tracking (hardware feedback).
+  // Skip pose detection (unused for the cardboard feed) and relax the hand-detection
+  // confidence (a cardboard cutout doesn't look like real skin to the model) - both
+  // cut load on this second concurrent tracking pipeline so it doesn't stall.
+  const { isModelLoaded: isSecModelLoaded, setOnResults: setSecOnResults } = useHandTracking(secVideoEl, {
+    detectPose: false,
+    minHandDetectionConfidence: 0.3,
+    minHandPresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3,
+  });
   const physicalFeedback = use3DStore(state => state.physicalFeedback);
   const lastCommandedAnglesRef = useRef<number[] | null>(null);
   
@@ -124,61 +205,24 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
         
         ctx.save();
         ctx.clearRect(0, 0, canvas.width, canvas.height);
-        
-        if (appState !== 'VIDEO_PROCESS') {
-          ctx.translate(canvas.width, 0);
-          ctx.scale(-1, 1);
-        }
+
+        // Unlike the primary (selfie) camera, the phone/Camo camera feed is shown
+        // un-mirrored (raw, matching the physical world) - see the <video> element below.
+        // No canvas transform needed here: drawing landmarks at their raw x already
+        // lines up with that un-mirrored video.
 
         const hasCardboardHand = result.hands && result.hands.landmarks.length > 0;
 
-        // Calibration target: the cardboard hand (via the phone/Camo camera) must align
-        // with the recorded expert profile's first frame, not the trainee's live webcam hand.
-        if (isCalibratingRef.current && savedProfile && savedProfile.frames.length > 0) {
+        // While the countdown runs, show the expert profile's starting pose as a
+        // reference on the cardboard camera feed so the trainee knows what to line up
+        // with before diffing starts (no alignment gating anymore - just a preview).
+        if (isCountingDownRef.current && savedProfile && savedProfile.frames.length > 0) {
           const ghostFrame = savedProfile.frames[0];
 
           if (ghostFrame.landmarks.length > 0) {
             ghostFrame.landmarks.forEach(handLandmarks => {
               renderGhostHand(ctx, handLandmarks, canvas.width, canvas.height, 50, ghostFrame.poseLandmarks?.[0]); // score 50 = yellow
             });
-          }
-
-          if (hasCardboardHand) {
-            // The cardboard/Camo camera and the camera that recorded the expert profile have
-            // different framing, zoom and distance to the hand, so raw on-screen (x, y) positions
-            // are never comparable across the two feeds -- a perfect pose match would still read
-            // as "far apart". Normalize both hands (wrist-relative, scaled by hand size) so the
-            // comparison measures hand SHAPE instead of screen position.
-            const cardboardLms = normalizeHand(result.hands!.landmarks[0]);
-            const ghostLms = normalizeHand(ghostFrame.landmarks[0]);
-
-            let totalDist = 0;
-            for (let i = 0; i < 21; i++) {
-              const dx = cardboardLms[i].x - ghostLms[i].x;
-              const dy = cardboardLms[i].y - ghostLms[i].y;
-              totalDist += Math.sqrt(dx * dx + dy * dy);
-            }
-            const avgDist = totalDist / 21;
-            const now = performance.now();
-
-            // Threshold is in normalized (wrist-to-MCP = 1 unit) space, not raw screen space,
-            // so it's a different scale than the old raw-pixel threshold.
-            if (avgDist < 0.3) {
-              if (calibrationHoldStartRef.current === 0) calibrationHoldStartRef.current = now;
-              const holdDuration = now - calibrationHoldStartRef.current;
-              const progress = Math.min(100, (holdDuration / 2000) * 100); // 2 second hold
-              setCalibrationProgress(progress);
-
-              if (progress >= 100) {
-                triggerPlayback();
-              }
-            } else {
-              calibrationHoldStartRef.current = 0;
-              setCalibrationProgress(0);
-            }
-          } else {
-            calibrationHoldStartRef.current = 0;
-            setCalibrationProgress(0);
           }
         }
 
@@ -196,8 +240,23 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
             { x: lm[20].x, y: lm[20].y }
           ];
 
-          use3DStore.getState().setPhysicalFeedback({ points: tips, angles: [0,0,0,0,0] });
+          // Actual observed curl angles from the cardboard hand (same formula used to
+          // command the servos), so the SYNC% / per-finger error readout below reflects
+          // real hardware feedback instead of a placeholder.
+          const observedAngles = hardwareBridge.calculateAngles(lm);
+          use3DStore.getState().setPhysicalFeedback({ points: tips, angles: observedAngles });
           use3DStore.getState().setCardboardFrameData(result.hands!.landmarks, canvas.width / canvas.height);
+
+          // Feed the diffing score/waveform from the cardboard hand too - some demo setups
+          // only have the cardboard hand active with nobody in front of the main webcam, so
+          // that camera's own DTW dispatch (above, in the main tracking loop) never fires.
+          // The shared throttle in dispatchDtwFrame means whichever camera has a hand when
+          // its ~100ms window opens is the one that gets used.
+          if (isPlayingRef.current && savedProfile && savedProfile.frames.length > 0) {
+            const now = performance.now();
+            const playbackTime = (now - playbackStartTimeRef.current) % savedProfile.duration;
+            dispatchDtwFrame(result.hands!.landmarks, undefined, playbackTime, savedProfile.frames, now);
+          }
         } else {
           use3DStore.getState().setPhysicalFeedback(null);
           use3DStore.getState().setCardboardFrameData(null);
@@ -222,6 +281,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   useEffect(() => {
     workerRef.current = new Worker(new URL('../utils/dtwWorker.ts', import.meta.url), { type: 'module' });
     workerRef.current.onmessage = (e: MessageEvent<DtwWorkerOutput>) => {
+      dtwScoresRef.current = e.data;
       setDtwScores(e.data);
       if (isPlayingRef.current) {
         attemptScoresRef.current.push({
@@ -246,7 +306,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
   }, []);
 
   const handleStartRecording = () => {
-    if (isPlayingRef.current || isCalibratingRef.current) return;
+    if (isPlayingRef.current || isCountingDownRef.current) return;
     setIsPlaying(false);
     isPlayingRef.current = false;
     
@@ -254,7 +314,6 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
     recordingStartTimeRef.current = performance.now();
     setIsRecording(true);
     isRecordingRef.current = true;
-    useAppStore.getState().setRecordedSession(null);
   };
   
   // Auto-start waiting for gesture when video is uploaded
@@ -291,25 +350,50 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
   const handleStartPlayback = () => {
     if (isRecordingRef.current) return;
-    setIsCalibrating(true);
-    isCalibratingRef.current = true;
-    setCalibrationProgress(0);
-    calibrationHoldStartRef.current = 0;
-    
+
+    if (countdownTimeoutRef.current) {
+      clearTimeout(countdownTimeoutRef.current);
+      countdownTimeoutRef.current = null;
+    }
+
+    setIsCountingDown(true);
+    isCountingDownRef.current = true;
+    setCountdownValue(5);
+
     recentLiveFramesRef.current = [];
     attemptFramesRef.current = [];
     attemptScoresRef.current = [];
+    dtwScoresRef.current = null;
     setDtwScores(null);
     setIsRecording(false);
     isRecordingRef.current = false;
+
+    // Simple 5-second countdown (5,4,3,2,1) then diffing starts automatically -
+    // no more "hold your hand aligned" gating.
+    let remaining = 5;
+    const tick = () => {
+      remaining -= 1;
+      if (remaining <= 0) {
+        countdownTimeoutRef.current = null;
+        triggerPlayback();
+        return;
+      }
+      setCountdownValue(remaining);
+      countdownTimeoutRef.current = setTimeout(tick, 1000);
+    };
+    countdownTimeoutRef.current = setTimeout(tick, 1000);
   };
 
   const handleStopPlayback = () => {
-    setIsCalibrating(false);
-    isCalibratingRef.current = false;
+    if (countdownTimeoutRef.current) {
+      clearTimeout(countdownTimeoutRef.current);
+      countdownTimeoutRef.current = null;
+    }
+    setIsCountingDown(false);
+    isCountingDownRef.current = false;
     setIsPlaying(false);
     isPlayingRef.current = false;
-    
+
     if (attemptFramesRef.current.length > 0 && savedProfile) {
       const attempt: AttemptRecord = {
         id: Date.now().toString(),
@@ -323,6 +407,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       useAppStore.getState().setActiveAttempt(attempt);
       useAppStore.getState().setAppState('REPLAY');
     }
+    dtwScoresRef.current = null;
     setDtwScores(null);
   };
 
@@ -337,8 +422,15 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
   const handleStopAll = () => {
     if (isRecordingRef.current) handleStopRecording();
-    if (isPlayingRef.current || isCalibratingRef.current) handleStopPlayback();
+    if (isPlayingRef.current || isCountingDownRef.current) handleStopPlayback();
   };
+
+  // Clear any in-flight countdown timer if the component unmounts mid-countdown.
+  useEffect(() => {
+    return () => {
+      if (countdownTimeoutRef.current) clearTimeout(countdownTimeoutRef.current);
+    };
+  }, []);
 
   const { isListening, toggleListening } = useVoiceControl({
     'kinetisync record': handleStartRecording,
@@ -464,7 +556,7 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
 
   // Main Tracking & Rendering Loop
   useEffect(() => {
-    let lastWorkerTime = 0;
+    let lastHardwareSendTime = 0;
 
     setOnResults((result: BiomechanicalResult) => {
       const canvas = canvasRef.current;
@@ -527,110 +619,70 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       // 2. Playback & DTW Analysis
       let currentGhostFrame: MotionFrame | null = null;
       
-      // -- CALIBRATION PHASE --
-      // Alignment gating now happens against the cardboard hand's camera feed (see the
-      // secondary useHandTracking effect above); here we just keep the ghost frame pinned
-      // to frame 0 so the Digital Twin's ghost hand stays visible during calibration.
-      if (isCalibratingRef.current && savedProfile && savedProfile.frames.length > 0) {
+      // -- COUNTDOWN PHASE --
+      // Keep the ghost frame pinned to frame 0 so the Digital Twin's ghost hand is
+      // visible as a preview while the 5-second countdown runs before diffing starts.
+      if (isCountingDownRef.current && savedProfile && savedProfile.frames.length > 0) {
         currentGhostFrame = savedProfile.frames[0];
       }
 
       // -- PLAYBACK PHASE --
       else if (isPlayingRef.current && savedProfile && savedProfile.frames.length > 0) {
         const playbackTime = (now - playbackStartTimeRef.current) % savedProfile.duration;
-        
-        // Find nearest ghost frame for rendering using binary search O(log n)
-        let low = 0;
-        let high = savedProfile.frames.length - 1;
-        
-        while (low <= high) {
-          const mid = Math.floor((low + high) / 2);
-          const midTime = savedProfile.frames[mid].timestamp;
-          
-          if (midTime === playbackTime) {
-            currentGhostFrame = savedProfile.frames[mid];
-            break;
-          } else if (midTime < playbackTime) {
-            low = mid + 1;
-          } else {
-            high = mid - 1;
-          }
-        }
-        
-        if (!currentGhostFrame) {
-          const lowFrame = savedProfile.frames[low];
-          const highFrame = savedProfile.frames[high];
-          
-          if (lowFrame && !highFrame) currentGhostFrame = lowFrame;
-          else if (!lowFrame && highFrame) currentGhostFrame = highFrame;
-          else if (lowFrame && highFrame) {
-             const lowDiff = Math.abs(lowFrame.timestamp - playbackTime);
-             const highDiff = Math.abs(highFrame.timestamp - playbackTime);
-             currentGhostFrame = lowDiff < highDiff ? lowFrame : highFrame;
-          }
-        }
+        currentGhostFrame = findGhostFrame(savedProfile.frames, playbackTime);
 
         // Render Ghost Hand
         if (currentGhostFrame && currentGhostFrame.landmarks.length > 0) {
-          const score = dtwScores?.overallScore ?? 100; // default to cyan
+          const score = dtwScoresRef.current?.overallScore ?? 100; // default to cyan
           currentGhostFrame.landmarks.forEach(handLandmarks => {
             renderGhostHand(ctx, handLandmarks, canvas.width, canvas.height, score, currentGhostFrame?.poseLandmarks?.[0]);
           });
         }
 
         // Update Telemetry History
-        if (dtwScores) {
-           telemetryHistoryRef.current.push(dtwScores.overallScore);
+        if (dtwScoresRef.current) {
+           telemetryHistoryRef.current.push(dtwScoresRef.current.overallScore);
            if (telemetryHistoryRef.current.length > 100) {
              telemetryHistoryRef.current.shift();
            }
         }
 
-        // DTW Worker Dispatch (Throttle to ~10fps to avoid saturating worker)
-        if (hasHand && now - lastWorkerTime > 100) {
-          attemptFramesRef.current.push({
-            timestamp: playbackTime,
-            landmarks: result.hands!.landmarks,
-            poseLandmarks: result.pose?.landmarks
-          });
-
-          const normalizedLive = normalizeHand(result.hands!.landmarks[0]);
-          recentLiveFramesRef.current.push(normalizedLive);
-          if (recentLiveFramesRef.current.length > WINDOW_SIZE) {
-            recentLiveFramesRef.current.shift();
-          }
-
-          // Extract Ghost Window
-          const ghostWindow = savedProfile.frames
-            .filter(f => Math.abs(f.timestamp - playbackTime) < 500) // +/- 500ms
-            .map(f => normalizeHand(f.landmarks[0]));
-
-          if (recentLiveFramesRef.current.length > 5 && ghostWindow.length > 5) {
-            workerRef.current?.postMessage({
-              liveWindow: [...recentLiveFramesRef.current],
-              ghostWindow: ghostWindow
-            });
-            lastWorkerTime = now;
-          }
+        // DTW Worker Dispatch (Throttle to ~10fps to avoid saturating worker).
+        // Uses the trainee webcam's hand when present - the cardboard camera loop below
+        // dispatches its own frames the same way when this camera has nothing to offer.
+        if (hasHand) {
+          dispatchDtwFrame(result.hands!.landmarks, result.pose?.landmarks, playbackTime, savedProfile.frames, now);
         }
       } else {
+        dtwScoresRef.current = null;
         setDtwScores(null);
       }
 
-      // 3. Render Live Hand (On Video Canvas) & Send Hardware Angles
+      // 3. Render Live Hand (On Video Canvas)
       if (hasHand) {
-        const liveHand = result.hands!.landmarks[0];
-        
-        // Render
         result.hands!.landmarks.forEach(handLandmarks => {
           renderLiveHand(ctx, handLandmarks, canvas.width, canvas.height, firstPose);
         });
-        
-        // Transmit to Arduino Hardware (throttle to ~30fps)
-        if (now - lastWorkerTime > 30) {
-           const angles = hardwareBridge.calculateAngles(liveHand);
-           lastCommandedAnglesRef.current = angles;
-           hardwareBridge.sendAngles(angles);
+      }
+
+      // Send Hardware Angles (throttled to ~30fps, independent of the DTW worker throttle)
+      if (now - lastHardwareSendTime > 30) {
+        // While diffing is active, the cardboard hand must physically re-enact the
+        // recorded EXPERT path (the ghost frame at the current playback time), not
+        // whatever the trainee's live hand is doing - that's the whole point of
+        // "Initiate Diffing": showing the correct motion on the physical hand.
+        if (isPlayingRef.current && currentGhostFrame && currentGhostFrame.landmarks.length > 0) {
+          const expertHand = currentGhostFrame.landmarks[0];
+          const angles = hardwareBridge.calculateAngles(expertHand);
+          lastCommandedAnglesRef.current = angles;
+          hardwareBridge.sendAngles(angles);
+          lastHardwareSendTime = now;
+        } else if (hasHand) {
+          const liveHand = result.hands!.landmarks[0];
+          const angles = hardwareBridge.calculateAngles(liveHand);
+          lastCommandedAnglesRef.current = angles;
+          hardwareBridge.sendAngles(angles);
+          lastHardwareSendTime = now;
         }
       }
 
@@ -640,16 +692,14 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
       use3DStore.getState().setFrameData(
         hasHand ? result.hands!.landmarks : null,
         currentGhostFrame && currentGhostFrame.landmarks.length > 0 ? currentGhostFrame.landmarks : null,
-        dtwScores,
+        dtwScoresRef.current,
         canvas.width / canvas.height
       );
 
       // 5. Render Telemetry Waveform
-      import('../utils/renderingEngine').then(({ renderTelemetryWaveform }) => {
-         renderTelemetryWaveform(teleCtx, teleCanvas.width, teleCanvas.height, telemetryHistoryRef.current);
-      });
+      renderTelemetryWaveform(teleCtx, teleCanvas.width, teleCanvas.height, telemetryHistoryRef.current);
     });
-  }, [setOnResults, savedProfile, dtwScores, appState]);
+  }, [setOnResults, savedProfile, appState]);
 
   // Extract pinch distance for "Grip Force"
   let gripForce = 0;
@@ -712,17 +762,17 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
                 <DatabaseBackup size={12} />
                 EXPERT PROFILE LOADED
               </div>
-              {(!isPlaying && !isCalibrating) && (
-                <button 
+              {(!isPlaying && !isCountingDown) && (
+                <button
                   disabled={!isModelLoaded || !isReady}
-                  className={`btn-primary flex items-center gap-2 ${(!isModelLoaded || !isReady) ? 'opacity-50 cursor-not-allowed' : ''}`} 
+                  className={`btn-primary flex items-center gap-2 ${(!isModelLoaded || !isReady) ? 'opacity-50 cursor-not-allowed' : ''}`}
                   onClick={handleStartPlayback}
                 >
                   <Play size={16} className="fill-black" />
                   INITIATE DIFFING
                 </button>
               )}
-              {(isPlaying || isCalibrating) && (
+              {(isPlaying || isCountingDown) && (
                 <button className="btn-secondary flex items-center gap-2 bg-black/80 backdrop-blur border-accent" onClick={handleStopPlayback}>
                   <SquarePlay size={16} className="text-accent" />
                   HALT DIFFING
@@ -812,7 +862,9 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
               autoPlay
               playsInline
               muted
-              className={`w-full h-full object-cover absolute top-0 left-0 ${appState !== 'VIDEO_PROCESS' ? 'transform -scale-x-100' : ''}`}
+              // Shown un-mirrored (raw) on purpose - this camera is pointed AT the cardboard
+              // hand, not a selfie view, so mirroring it made it confusing to line up.
+              className="w-full h-full object-cover absolute top-0 left-0"
             />
             {/* Tracking Overlay */}
             <canvas
@@ -849,30 +901,17 @@ export const CameraView: React.FC<CameraViewProps> = ({ onStreamReady, onError }
            <DigitalTwin3D />
         </div>
 
-        {/* Calibration Overlay (Floating in center of split screen) */}
-        {isCalibratingRef.current && (
-          <div className="absolute inset-0 z-40 flex flex-col items-center justify-end pb-12 pointer-events-none">
-            <div className="panel p-6 bg-black/80 backdrop-blur-xl flex flex-row items-center gap-6 border-accent shadow-[0_0_40px_rgba(6,182,212,0.3)]">
-              <div className="flex flex-col gap-2 max-w-sm">
-                <h3 className="text-lg font-mono text-white tracking-[0.1em]">CALIBRATING ALIGNMENT</h3>
-                <p className="text-text-muted text-xs">
-                  Align your hand precisely with the glowing holographic target in the Digital Twin view.
-                </p>
-              </div>
-              <div className="relative w-16 h-16 flex items-center justify-center shrink-0">
-                <svg className="absolute inset-0 w-full h-full transform -rotate-90">
-                  <circle cx="32" cy="32" r="28" fill="none" stroke="rgba(255,255,255,0.1)" strokeWidth="4" />
-                  <circle 
-                    cx="32" cy="32" r="28" fill="none" 
-                    stroke="#06b6d4" strokeWidth="4" 
-                    strokeDasharray={176}
-                    strokeDashoffset={176 - (176 * calibrationProgress) / 100}
-                    className="transition-all duration-75 ease-linear"
-                  />
-                </svg>
-                <div className="text-sm font-mono font-bold text-white">
-                  {Math.round(calibrationProgress)}<span className="text-[10px] text-accent">%</span>
-                </div>
+        {/* Countdown Overlay (Floating in center of split screen) */}
+        {isCountingDownRef.current && (
+          <div className="absolute inset-0 z-40 flex flex-col items-center justify-center pointer-events-none">
+            <div className="panel p-8 bg-black/80 backdrop-blur-xl flex flex-col items-center gap-3 border-accent shadow-[0_0_40px_rgba(6,182,212,0.3)]">
+              <h3 className="text-sm font-mono text-white/70 tracking-[0.2em]">DIFFING STARTS IN</h3>
+              <div
+                key={countdownValue}
+                className="text-7xl font-mono font-bold text-accent animate-pulse"
+                style={{ textShadow: '0 0 40px rgba(6,182,212,0.6)' }}
+              >
+                {countdownValue}
               </div>
             </div>
           </div>

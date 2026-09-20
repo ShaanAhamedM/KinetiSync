@@ -65,7 +65,8 @@ export class HardwareBridge {
     // Normalize mapping: max distance = straight (0 deg), min distance = curled (180 deg)
     const mapToAngle = (distance: number, min: number, max: number) => {
        const clamped = Math.max(min, Math.min(max, distance));
-       const percentage = 1 - ((clamped - min) / (max - min));
+       // Flipped logic: max distance = 180 deg (straight), min distance = 0 deg (curled)
+       const percentage = (clamped - min) / (max - min);
        return Math.round(percentage * 180);
     };
 

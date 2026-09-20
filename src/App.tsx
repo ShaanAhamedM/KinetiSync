@@ -2,7 +2,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import { CameraView } from './components/CameraView';
 import { ReplayView } from './components/ReplayView';
 import { useAppStore } from './store/useAppStore';
-import { Activity, Power, Upload } from 'lucide-react';
+import { Power, Upload } from 'lucide-react';
 import { useRef } from 'react';
 
 function App() {

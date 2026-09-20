@@ -128,6 +128,7 @@ const DigitalTwinScene = () => {
           isExpert={false}
           colorOverride="#f97316"
           aspectRatio={cardboardAspectRatio}
+          mirrorX={true}
         />
       ))}
 

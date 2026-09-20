@@ -73,7 +73,10 @@ void parseAndMoveServos(String data) {
     // Clamp the angle between 0 and 180 for safety
     angles[i] = constrain(angles[i], 0, 180);
 
-    // Map the 0-180 degree angle to PCA9685 pulse lengths
+    // Map the 0-180 degree angle to PCA9685 pulse lengths.
+    // NORMAL: 0 degrees -> SERVOMIN, 180 degrees -> SERVOMAX
+    // (Flipped from the previous inverted mapping: the cardboard hand was
+    // closing when the human hand opened.)
     int pulse = map(angles[i], 0, 180, SERVOMIN, SERVOMAX);
 
     // Drive the servo on channels 0 through 4
